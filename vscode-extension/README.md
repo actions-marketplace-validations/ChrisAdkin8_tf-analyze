@@ -13,7 +13,7 @@
 
 ## ✨ What it does
 
-Brings the **`tf-analyze`** detection engine (215 catalogue rules across AWS, GCP, and Azure) into VS Code. The `.vsix` is **self-contained** — it bundles its own copy of the engine and rule catalogue, so installing the extension is the only step. No companion repo to clone, no `tf-analyze.scriptPath` setting to configure, no `pip install` to run.
+Brings the **`tf-analyze`** detection engine (352 catalogue rules across AWS, GCP, Azure and Kubernetes) into VS Code. The `.vsix` is **self-contained** — it bundles its own copy of the engine and rule catalogue, so installing the extension is the only step. No companion repo to clone, no `tf-analyze.scriptPath` setting to configure, no `pip install` to run.
 
 | | |
 |---|---|
@@ -36,7 +36,7 @@ Brings the **`tf-analyze`** detection engine (215 catalogue rules across AWS, GC
 ### 1. Install
 
 ```bash
-code --install-extension tf-analyze-0.1.57.vsix
+code --install-extension tf-analyze-0.1.58.vsix
 ```
 
 That's it. The extension ships with everything it needs.
@@ -104,9 +104,9 @@ Configure under **Settings → Extensions → tf-analyze**, or in `settings.json
 ## 📋 Requirements
 
 - **VS Code** `1.85.0` or later
-- **Python** `3.9+` on `$PATH` — used to run the bundled engine. Stdlib only; **no `pip install` step required.**
+- **Python** `3.9+` on `$PATH` — used to run the bundled engine. The HCL parser is bundled too; **no `pip install` step required.**
 
-The detection engine itself (`detect.py`) and the 215-entry rule catalogue ship inside the `.vsix`. You do **not** need to clone the [tf-analyze repo](https://github.com/ChrisAdkin8/tf-analyze) or install anything from PyPI.
+The detection engine itself (`detect.py`) and the 352-rule catalogue ship inside the `.vsix`. You do **not** need to clone the [tf-analyze repo](https://github.com/ChrisAdkin8/tf-analyze) or install anything from PyPI.
 
 ---
 
@@ -172,4 +172,4 @@ This is an engine-developer scenario only. Set `tf-analyze.scriptPath` to your c
 
 ---
 
-<sub>Self-contained `.vsix`. 217 rules · AWS · GCP · Azure · stdlib-only Python. Built with the `tf-analyze` Claude Code skill.</sub>
+<sub>Self-contained `.vsix`. 352 rules · AWS · GCP · Azure · no `pip install` needed. Built with the `tf-analyze` Claude Code skill.</sub>

@@ -29,7 +29,7 @@ Per-rule documentation auto-generated from the catalogue YAML ([`catalog/`](http
 
 | Rule | Urgency | Title |
 |------|---------|-------|
-| [`MOD-PIN-001`](./MOD-PIN-001.md) | HIGH | Module source not pinned |
+| [`MOD-PIN-001`](./MOD-PIN-001.md) | HIGH | Git module source not pinned to a ref |
 | [`MOD-SUPPLY-001`](./MOD-SUPPLY-001.md) | HIGH | Module pinned to mutable git ref (main or master) |
 | [`MOD-SUPPLY-003`](./MOD-SUPPLY-003.md) | HIGH | Registry module missing version constraint |
 | [`MOD-SUPPLY-004`](./MOD-SUPPLY-004.md) | MEDIUM | Module version constraint uses `>=` with no upper bound |
@@ -57,11 +57,11 @@ Per-rule documentation auto-generated from the catalogue YAML ([`catalog/`](http
 | [`OPS-GCP-LABELS-001`](./OPS-GCP-LABELS-001.md) | MEDIUM | GCP resource missing labels block |
 | [`OPS-AWS-CWL-001`](./OPS-AWS-CWL-001.md) | LOW | CloudWatch log group has no retention policy |
 
-## robustness (51)
+## robustness (50)
 
 | Rule | Urgency | Title |
 |------|---------|-------|
-| [`ROB-AWS-BACKEND-001`](./ROB-AWS-BACKEND-001.md) | HIGH | Terraform S3 backend missing DynamoDB state locking |
+| [`ROB-AWS-BACKEND-001`](./ROB-AWS-BACKEND-001.md) | HIGH | Terraform S3 backend missing state locking |
 | [`ROB-AWS-DDB-001`](./ROB-AWS-DDB-001.md) | HIGH | DynamoDB table missing deletion protection |
 | [`ROB-AWS-LIFECYCLE-001`](./ROB-AWS-LIFECYCLE-001.md) | HIGH | Stateful AWS resource missing lifecycle.prevent_destroy |
 | [`ROB-AWS-LIFECYCLE-002`](./ROB-AWS-LIFECYCLE-002.md) | HIGH | S3 bucket has force_destroy enabled |
@@ -102,7 +102,6 @@ Per-rule documentation auto-generated from the catalogue YAML ([`catalog/`](http
 | [`ROB-VALIDATION-001`](./ROB-VALIDATION-001.md) | MEDIUM | Variable accepts dangerous input without validation block |
 | [`ROB-VALIDATION-002`](./ROB-VALIDATION-002.md) | MEDIUM | Variable typed as bare any |
 | [`ROB-VERSION-001`](./ROB-VERSION-001.md) | MEDIUM | required_version floor too old for skill assumptions |
-| [`STK-GCP-DEPRECATION-001`](./STK-GCP-DEPRECATION-001.md) | MEDIUM | Resource uses deprecated argument |
 | [`ROB-COUNT-001`](./ROB-COUNT-001.md) | LOW | Boolean count pattern instead of for_each |
 | [`ROB-COUNT-002`](./ROB-COUNT-002.md) | LOW | Module mixes count-based and for_each-based resources |
 | [`ROB-DRIFT-003`](./ROB-DRIFT-003.md) | LOW | ignore_changes lists too many attributes (drift-disable by attrition) |
@@ -113,7 +112,7 @@ Per-rule documentation auto-generated from the catalogue YAML ([`catalog/`](http
 | [`ROB-UNUSED-002`](./ROB-UNUSED-002.md) | LOW | Declared output is never consumed by any caller |
 | [`ROB-VERSION-002`](./ROB-VERSION-002.md) | LOW | Submodule directory has no required_version |
 
-## security (193)
+## security (194)
 
 | Rule | Urgency | Title |
 |------|---------|-------|
@@ -158,7 +157,7 @@ Per-rule documentation auto-generated from the catalogue YAML ([`catalog/`](http
 | [`SEC-AWS-ES-002`](./SEC-AWS-ES-002.md) | HIGH | OpenSearch / Elasticsearch domain missing node-to-node encryption |
 | [`SEC-AWS-ES-003`](./SEC-AWS-ES-003.md) | HIGH | OpenSearch domain missing fine-grained access control |
 | [`SEC-AWS-GUARDDUTY-001`](./SEC-AWS-GUARDDUTY-001.md) | HIGH | GuardDuty detector not provisioned |
-| [`SEC-AWS-IAM-001`](./SEC-AWS-IAM-001.md) | HIGH | IAM policy with wildcard resource |
+| [`SEC-AWS-IAM-001`](./SEC-AWS-IAM-001.md) | HIGH | Inline IAM policy JSON grants wildcard `Resource: \"*\"` |
 | [`SEC-AWS-IAM-JSON-001`](./SEC-AWS-IAM-JSON-001.md) | HIGH | Inline IAM policy JSON grants wildcard `Action: \"*\"` |
 | [`SEC-AWS-IAM-POLICY-001`](./SEC-AWS-IAM-POLICY-001.md) | HIGH | IAM policy document grants wildcard `actions = [\"*\"]` |
 | [`SEC-AWS-IAM-POLICY-003`](./SEC-AWS-IAM-POLICY-003.md) | HIGH | IAM policy document grants wildcard `resources = [\"*\"]` |
@@ -176,7 +175,6 @@ Per-rule documentation auto-generated from the catalogue YAML ([`catalog/`](http
 | [`SEC-AWS-SG-001`](./SEC-AWS-SG-001.md) | HIGH | Security group allows ingress from 0.0.0.0/0 |
 | [`SEC-AWS-SNS-001`](./SEC-AWS-SNS-001.md) | HIGH | SNS topic missing KMS encryption |
 | [`SEC-AWS-SQS-001`](./SEC-AWS-SQS-001.md) | HIGH | SQS queue missing server-side encryption |
-| [`SEC-AWS-SSM-001`](./SEC-AWS-SSM-001.md) | HIGH | SSM Parameter Store parameter not encrypted as SecureString |
 | [`SEC-AWS-SSRF-001`](./SEC-AWS-SSRF-001.md) | HIGH | EC2 instance metadata service v1 enabled (IMDSv2 not enforced) |
 | [`SEC-AWS-VPC-FLOWLOGS-001`](./SEC-AWS-VPC-FLOWLOGS-001.md) | HIGH | AWS VPC missing flow log resource |
 | [`SEC-AZURE-ACR-001`](./SEC-AZURE-ACR-001.md) | HIGH | Azure Container Registry admin account enabled |
@@ -239,6 +237,7 @@ Per-rule documentation auto-generated from the catalogue YAML ([`catalog/`](http
 | [`SEC-K8S-SECRET-001`](./SEC-K8S-SECRET-001.md) | HIGH | kubernetes_secret carries literal `data` (vs ExternalSecret / Vault Secrets Operator) |
 | [`SEC-PROVISIONER-001`](./SEC-PROVISIONER-001.md) | HIGH | Provisioner block used for shell execution |
 | [`SEC-SECRETS-002`](./SEC-SECRETS-002.md) | HIGH | aws_ssm_parameter stores a sensitive value as plain `String` (not `SecureString`) |
+| [`SEC-SECRETS-ENTROPY-001`](./SEC-SECRETS-ENTROPY-001.md) | HIGH | High-entropy string literal — probable hardcoded secret (API token / access key) |
 | [`SEC-SENSITIVE-001`](./SEC-SENSITIVE-001.md) | HIGH | Sensitive output not marked sensitive=true |
 | [`SEC-SENSITIVE-002`](./SEC-SENSITIVE-002.md) | HIGH | Sensitive marker dropped at module boundary |
 | [`SEC-SENSITIVE-003`](./SEC-SENSITIVE-003.md) | HIGH | Sensitive variable passed to templatefile() |
@@ -306,6 +305,7 @@ Per-rule documentation auto-generated from the catalogue YAML ([`catalog/`](http
 | [`SEC-LOG-CROSS-ACCOUNT-001`](./SEC-LOG-CROSS-ACCOUNT-001.md) | MEDIUM | Audit log destination is in the same AWS account (no cross-account isolation) |
 | [`SEC-PROVIDER-001`](./SEC-PROVIDER-001.md) | MEDIUM | Provider version constraint missing upper bound |
 | [`SEC-USERDATA-002`](./SEC-USERDATA-002.md) | MEDIUM | user_data passes a sensitive var unencoded (base64encode missing) |
+| [`SEC-AWS-SSM-001`](./SEC-AWS-SSM-001.md) | LOW | SSM parameter not stored as SecureString |
 | [`SEC-AZURE-BASTION-001`](./SEC-AZURE-BASTION-001.md) | LOW | Azure Bastion host using Basic SKU (no shareable links, no RBAC) |
 | [`SEC-AZURE-PRIVATE-DNS-001`](./SEC-AZURE-PRIVATE-DNS-001.md) | LOW | Azure Private DNS zone missing virtual network link |
 | [`SEC-AZURE-VNET-ENC-001`](./SEC-AZURE-VNET-ENC-001.md) | LOW | Azure Virtual Network missing VNet encryption |
@@ -323,7 +323,7 @@ Per-rule documentation auto-generated from the catalogue YAML ([`catalog/`](http
 | [`STK-AWS-LAUNCH-TEMPLATE-001`](./STK-AWS-LAUNCH-TEMPLATE-001.md) | HIGH | EC2 launch template does not enforce IMDSv2 |
 | [`STK-AWS-RDS-004`](./STK-AWS-RDS-004.md) | HIGH | RDS instance uses end-of-life database engine version |
 | [`STK-AZURE-AKS-003`](./STK-AZURE-AKS-003.md) | HIGH | AKS cluster workload identity not enabled |
-| [`STK-AZURE-AKS-004`](./STK-AZURE-AKS-004.md) | HIGH | AKS cluster API server is publicly accessible |
+| [`STK-AZURE-AKS-004`](./STK-AZURE-AKS-004.md) | HIGH | AKS public API server has no authorized IP ranges |
 | [`STK-AZURE-AKS-VERSION-001`](./STK-AZURE-AKS-VERSION-001.md) | HIGH | Azure AKS cluster on end-of-life Kubernetes version |
 | [`STK-AZURE-DB-001`](./STK-AZURE-DB-001.md) | HIGH | Azure MySQL/PostgreSQL server missing SSL enforcement |
 | [`STK-AZURE-FUNCTION-001`](./STK-AZURE-FUNCTION-001.md) | HIGH | Azure Function App uses end-of-life runtime |
@@ -333,7 +333,7 @@ Per-rule documentation auto-generated from the catalogue YAML ([`catalog/`](http
 | [`STK-AZURE-NSG-FLOWLOG-001`](./STK-AZURE-NSG-FLOWLOG-001.md) | HIGH | Azure NSG missing flow log resource |
 | [`STK-AZURE-RECOVERY-001`](./STK-AZURE-RECOVERY-001.md) | HIGH | Azure Recovery Services Vault missing soft-delete protection |
 | [`STK-AZURE-SQL-001`](./STK-AZURE-SQL-001.md) | HIGH | Azure MySQL/PostgreSQL single server is deprecated |
-| [`STK-AZURE-SQL-TDE-001`](./STK-AZURE-SQL-TDE-001.md) | HIGH | Azure SQL Database missing transparent data encryption resource |
+| [`STK-AZURE-SQL-TDE-001`](./STK-AZURE-SQL-TDE-001.md) | HIGH | Azure SQL Database has transparent data encryption turned off |
 | [`STK-AZURE-VM-IMG-EOL-001`](./STK-AZURE-VM-IMG-EOL-001.md) | HIGH | Azure virtual machine using end-of-life OS image |
 | [`STK-AZURE-WEBAPP-RUNTIME-001`](./STK-AZURE-WEBAPP-RUNTIME-001.md) | HIGH | Azure App Service Web App uses end-of-life runtime |
 | [`STK-GCP-BIGQUERY-001`](./STK-GCP-BIGQUERY-001.md) | HIGH | BigQuery dataset missing default CMEK |
@@ -348,7 +348,7 @@ Per-rule documentation auto-generated from the catalogue YAML ([`catalog/`](http
 | [`STK-GCP-GCS-LOGGING-001`](./STK-GCP-GCS-LOGGING-001.md) | HIGH | GCS bucket logging target lacks public_access_prevention |
 | [`STK-GCP-GKE-001`](./STK-GCP-GKE-001.md) | HIGH | GKE cluster missing private nodes |
 | [`STK-GCP-GKE-002`](./STK-GCP-GKE-002.md) | HIGH | GKE cluster missing Workload Identity |
-| [`STK-GCP-GKE-003`](./STK-GCP-GKE-003.md) | HIGH | GKE cluster missing application-layer secrets encryption |
+| [`STK-GCP-GKE-003`](./STK-GCP-GKE-003.md) | HIGH | GKE cluster has application-layer secrets encryption turned off |
 | [`STK-GCP-GKE-004`](./STK-GCP-GKE-004.md) | HIGH | GKE cluster missing master authorized networks |
 | [`STK-GCP-GKE-NODEPOOL-001`](./STK-GCP-GKE-NODEPOOL-001.md) | HIGH | GKE node pool missing shielded-instance hardening |
 | [`STK-GCP-KMS-001`](./STK-GCP-KMS-001.md) | HIGH | KMS crypto key missing rotation period |
@@ -358,7 +358,7 @@ Per-rule documentation auto-generated from the catalogue YAML ([`catalog/`](http
 | [`STK-K8S-INGRESS-001`](./STK-K8S-INGRESS-001.md) | HIGH | kubernetes_ingress_v1 has no `tls` block (HTTP traffic exposed in clear) |
 | [`STK-K8S-PSA-002`](./STK-K8S-PSA-002.md) | HIGH | kubernetes_namespace Pod Security Admission `enforce` level is `privileged` (no enforcement) |
 | [`STK-K8S-PSP-001`](./STK-K8S-PSP-001.md) | HIGH | kubernetes_pod_security_policy is declared (deprecated 1.21, removed 1.25) |
-| [`STK-K8S-VERSION-001`](./STK-K8S-VERSION-001.md) | HIGH | EKS/GKE/AKS cluster pinned to a Kubernetes version older than N-2 |
+| [`STK-K8S-VERSION-001`](./STK-K8S-VERSION-001.md) | HIGH | EKS/GKE cluster on a Kubernetes version past end of standard support |
 | [`STK-AWS-ECS-001`](./STK-AWS-ECS-001.md) | MEDIUM | ECS cluster Container Insights not configured |
 | [`STK-AWS-EKS-004`](./STK-AWS-EKS-004.md) | MEDIUM | EKS cluster missing OIDC provider for IRSA |
 | [`STK-AWS-LAMBDA-002`](./STK-AWS-LAMBDA-002.md) | MEDIUM | Lambda function missing dead-letter queue configuration |

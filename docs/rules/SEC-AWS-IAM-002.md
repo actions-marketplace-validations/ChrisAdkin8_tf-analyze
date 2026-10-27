@@ -41,20 +41,16 @@ keywords: "security, critical, terraform, iac, aws, cis-1.16, mitre-T1078.004, c
 
 ## What this checks
 
-1. **`grep`** matching `/"Principal"\s*:\s*"\*"/` — _a textual regex matched somewhere in the file._
-  IAM assume role policy with Principal = "*"
-2. **`grep`** matching `/principals\s*\{[^}]*type\s*=\s*"\*"/` — _a textual regex matched somewhere in the file._
-  aws_iam_role inline principals block with type = "*"
-3. **`grep`** matching `/Principal\s*=\s*"\*"/` — _a textual regex matched somewhere in the file._
-  IAM assume role policy Principal = "*" in jsonencode HCL object syntax
+1. **`iam_json_policy_analysis`** — check: `public_principal` — _an inline `policy = jsonencode({...})` Allow statement matches the listed check._
+  The role's trust policy (`assume_role_policy`, as `jsonencode`,
+heredoc or JSON string) has an Allow statement whose `Principal`
+is `"*"` or has a `"*"` value (`{ AWS = "*" }`).
 
 ## Why it likely fired
 
-IAM assume role policy with Principal = "*"
-
-aws_iam_role inline principals block with type = "*"
-
-IAM assume role policy Principal = "*" in jsonencode HCL object syntax
+The role's trust policy (`assume_role_policy`, as `jsonencode`,
+heredoc or JSON string) has an Allow statement whose `Principal`
+is `"*"` or has a `"*"` value (`{ AWS = "*" }`).
 
 ## Adversarial scenario
 
@@ -141,7 +137,7 @@ wildcard principal.
 
 See also rules in the `SEC-AWS-IAM-*` family:
 
-- [`SEC-AWS-IAM-001`](./SEC-AWS-IAM-001.md) — IAM policy with wildcard resource
+- [`SEC-AWS-IAM-001`](./SEC-AWS-IAM-001.md) — Inline IAM policy JSON grants wildcard `Resource: \"*\"`
 - [`SEC-AWS-IAM-003`](./SEC-AWS-IAM-003.md) — IAM account password policy is not configured or too weak
 
 ---

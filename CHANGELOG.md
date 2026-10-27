@@ -5,6 +5,1184 @@ Self-test fixture counts are cumulative.
 
 ---
 
+## Round 70 — `--apply-fixes` never leaves a file worse than it found it — 2026-10-27
+
+- **Multi-line values**: replacing a value that spans several lines (a
+  list, map, call or heredoc) only overwrote its first line, leaving the
+  rest behind as invalid HCL — e.g. `"api",` and `]` after the new
+  `enabled_cluster_log_types` list. The whole old value is now replaced.
+- **Indentation**: a multi-line fix kept the catalogue snippet's
+  indentation and `\n` endings, so the first line was indented twice and
+  the rest did not match the file. Fixes are now re-indented to the
+  file's own step (two or four spaces, or tabs) and line endings.
+- **Encoding**: files are read and written as UTF-8, the encoding
+  Terraform uses, not the locale's (cp1252 on Windows). A file that is
+  not UTF-8 is skipped with a warning instead of being rewritten.
+- **Atomic writes**: the patched file is written to a temporary file in
+  the same folder and swapped in, keeping its permissions; an
+  interrupted run leaves the original or the patched file, never half of
+  one. The `.bak` backup is still written first.
+
+---
+
+## Round 69 — Rules miss fewer real problems and flag fewer safe ones — 2026-10-27
+
+Findings change: some rules now fire where they did not, others stop
+firing on safe configuration. Terragoat totals are unchanged.
+
+- **"Open to the world", however it is written**: a CIDR counts as the
+  whole internet when its prefix length is 0, so `0::/0`, `::0/0` and
+  `0000::/0` are caught like `::/0`. Only the two canonical strings
+  were matched.
+- **GCP firewall with no source**: an ingress rule with no
+  `source_ranges`, `source_tags` or `source_service_accounts` is treated
+  as `0.0.0.0/0`, which is what Google Cloud applies. SSH open to
+  everyone this way was not flagged.
+- **IAM action names are case-insensitive**: `"IAM:*"` now triggers the
+  `iam:*` rules, and `"EC2:DescribeInstances"` on `Resource = "*"` is no
+  longer flagged as a wildcard grant.
+- **`SEC-AZURE-SQL-002`** measures the whole start–end range with the
+  new `ip_range_span` pattern kind (fires above a /8). Matching the end
+  address against `255.255.255.255` missed `0.0.0.1`–`255.255.255.254`,
+  and flagged the tiny `255.255.255.0`–`255.255.255.255`.
+- **`SEC-AWS-S3-001`**: an encryption configuration that points at the
+  bucket through the same `local.` / `var.` expression (`bucket =
+  local.bucket_name` on both) now counts. It was a false positive.
+- **`SEC-AWS-EBS-001`** does not fire when `aws_ebs_encryption_by_default`
+  is anywhere in the scan (any module) and not `enabled = false`: every
+  new volume is then encrypted. New pattern option `unless_repo_has`,
+  honoured in plan mode too.
+- **`SEC-AWS-IAM-JSON-003` / `SEC-AWS-IAM-POLICY-005`** no longer
+  recommend attaching the managed `AdministratorAccess` policy, which
+  grants the same access and cleared the finding without fixing it.
+- **`STK-GCP-DEPRECATION-001` is retired** (`status: deprecated`). None
+  of the arguments it called deprecated is deprecated in the google
+  provider, and its `.*` patterns fired on the secure
+  `enable_legacy_abac = false`. Active rules: 353 (GCP 90).
+
+---
+
+## Round 68 — Every scan mode gates like a static scan — 2026-10-27
+
+**Exit codes change.** CI jobs that use these modes may start failing
+where they used to pass; each case below was a scan that had not
+checked what it claimed to.
+
+- **`--plan-json` / `--state-json`**: a missing, unreadable, malformed
+  or wrong-kind file (state passed as a plan, or the reverse) printed
+  ERROR, returned no findings and passed `--fail-on`. It now exits 2,
+  like a missing target, with a hint naming the right flag. The HCP
+  Terraform Run Task therefore fails the run (`SYN-SCAN-FAILED`)
+  instead of reporting 0 findings.
+- **`--mode verify-fixed`**:
+  - Applies `--fail-on` to STILL-PRESENT and MOVED findings. It always
+    exited 0.
+  - A file that cannot be read is now UNREADABLE (a new results key)
+    and fails `--fail-on`. Its findings used to come out RESOLVED.
+  - `--prior-report` reads the CLI's own `--format json` and
+    `--format text` reports, which used to parse to zero findings. An
+    HTML report exits 2 instead of verifying nothing.
+- **`--mode fleet`** runs each target through the same pipeline as a
+  static scan (the new `_scan_target`), so it now applies:
+  - inline and `.tf-analyze-ignore.yaml` suppressions (the JSON report
+    gains `suppressed_count`)
+  - each target's own `.tf-analyze.yaml` (`ignore_rules`, `ignore_paths`)
+  - the `applies_when` filter, and `var.` / `local.` resolution
+  - the no-Terraform check (exit 2 under `--fail-on`)
+  - `--fail-on-parse-error`
+
+  A missing `--targets-file` and `--plan-json` / `--state-json` exit 2;
+  they used to be ignored silently.
+- **`--mode pr-review`** applies `--baseline` before posting comments and
+  gating. Baselined findings were posted and failed the gate.
+
+---
+
+## Round 67 — Untrusted pull requests can't script the report or hijack the summary — 2026-10-27
+
+- **HTML report**: the Suppressed list was the one section that skipped
+  HTML escaping. A suppression reason in `.tf-analyze-ignore.yaml`, or a
+  file name, could put a running `<script>` in `tf-analyze-report.html`.
+  It is now escaped like every other field.
+- **VS Code report panel**: the Content-Security-Policy was skipped when
+  the words "Content-Security-Policy" appeared anywhere in the report,
+  which report text controls. It is now always injected.
+- **PR summary comment** (Action and `integrations/github-action.yml`):
+  the comment to update was found by its first line alone, so a PR
+  author could post `## tf-analyze: …` and receive every later summary
+  in a comment they can edit. It must now be written by
+  `github-actions[bot]`, and all pages of comments are searched, so PRs
+  with more than 30 comments no longer get a new summary each run.
+- **`integrations/github-action.yml`**: the top-level `inputs:` block
+  (not valid workflow syntax) moved under `workflow_dispatch`. Inputs
+  reach the shell through `env:`. Actions are pinned to commit SHAs. The
+  engine `ref` defaults to `v0.2.6` instead of `main`. The `fail-on`
+  gate never failed, because its exit code was lost in `| tee`; the step
+  now sets `pipefail`.
+- **`integrations/github-action-bot.yml`**: inputs reach the shell
+  through `env:`; actions are pinned; `ref` defaults to `v0.2.6`. It no
+  longer deletes or commits tracked `.bak` files (`git add -u` instead
+  of `git add -A`), and `pip install python-hcl2` is hash-pinned (7.2.1, with lark 1.3.1)
+  (v0.2.6 predates the vendored parser and uses it only when installed).
+- **Template default engine**: `v0.2.6` is the latest release, and it
+  predates this round's HTML escaping fix and the vendored parser. Bump
+  the templates' `ref` default when the next release is tagged; until
+  then, set `ref:` to a commit that includes these fixes if you upload
+  the HTML report from untrusted PRs.
+- **pre-commit hooks** run the installed `tf-analyze` command. The old
+  `python3 scripts/detect.py` entry looked for that file in *your* repo.
+
+---
+
+## Round 66 — A gated scan that checked nothing fails — 2026-10-27
+
+- **Empty target**: a scan with `--fail-on` that found no `.tf` /
+  `.tf.json` files (wrong folder, or `ignore_paths` excluding everything)
+  scored 100 (A) and exited 0, so a misconfigured CI job passed having
+  checked nothing. It now exits 2, like a missing target. Without
+  `--fail-on` it stays a warning; `--plan-json` / `--state-json` input
+  counts as a real scan; diff mode on a PR that changes no Terraform
+  still passes.
+- **GitHub Action**: the Action gates in its own step (it does not pass
+  `--fail-on` to the engine), so the JSON summary now carries
+  `"nothing_scanned": true` in that case and the gate step fails on it.
+- **`--apply-fixes apply`** is documented as exiting 0 after patching
+  without applying `--fail-on`; re-run the scan to gate.
+
+---
+
+## Round 65 — verify-fixed works, SARIF severity per finding, big files 2.5x faster — 2026-10-27
+
+The remaining smaller findings from the critical review.
+
+- **`--mode verify-fixed`** was broken three ways:
+  - its report-row regex allowed only letters between the dashes of a
+    rule ID, so 23 rules (SEC-AWS-S3-001, every SEC-K8S-*) and all
+    CUSTOM-* rules were silently dropped from verification;
+  - `reprobe_finding` can return BROKEN-SYMLINK but the results had no
+    such key, so a broken symlink in the target crashed the run;
+  - the report's relative path (`main.tf`) was compared as a string with
+    the scanner's absolute path, so every still-present finding came out
+    MOVED (and the corpus pass ran against the current directory, not
+    the target). Paths are now resolved against the target.
+- **SARIF results** took `level` from the rule's default, so an escalated
+  finding (SSH open to the world: CRITICAL, rule default HIGH) was
+  reported at the default. Each result now carries its own `level` and
+  `security-severity` (GitHub documents `security-severity` on the rule,
+  so its score may still follow the rule; `level` is per result).
+- **Large files**: `find_blocks` computed each block's line with
+  `text.count("\n", 0, pos)`, re-scanning the file from the top per
+  block. A cached newline table and a binary search replace it: a
+  4,000-resource file scans in 3.1 s instead of 7.8 s, with identical
+  findings and line numbers.
+
+---
+
+## Round 64 — Rule accuracy: current version lists, tighter matches, no duplicates — 2026-10-26
+
+From the critical review's catalogue findings. Version cut-offs were
+checked against the providers' own pages on 2026-10-26 (AWS Lambda
+runtimes, RDS release calendars, EKS / AKS / GKE release calendars) and
+each rule notes the date and the next change due.
+
+- **STK-AWS-RDS-004** used one version list for every engine, so `10.`
+  flagged MariaDB 10.11 (supported) while MySQL 5.7 was missed. It now has
+  a pattern per engine, each skipped only when `engine` is a different
+  known engine: PostgreSQL 9.x–13, MySQL 5.x and 8.0 (standard support
+  ended 2026-07-31), MariaDB 10.0–10.5.
+- **STK-AWS-LAMBDA-001** adds the runtimes deprecated since the list was
+  written: python3.8/3.9, nodejs16.x/18.x/20.x, ruby2.7/3.2, dotnet5–7,
+  provided, provided.al2 and the older Node.js identifiers.
+- **Kubernetes versions**: STK-K8S-VERSION-001 and
+  STK-AZURE-AKS-VERSION-001 both fired on AKS with different, stale
+  cut-offs (1.27 / 1.26). AKS is now only STK-AZURE-AKS-VERSION-001; both
+  flag ≤ 1.33, past end of standard support on EKS, GKE and AKS.
+- **SEC-AWS-LOG-RETENTION-001** matched `log` inside any name (`catalog`,
+  `unlogged`); it now matches whole name parts.
+- **SEC-GCP-COMPUTE-PUBLIC-IP-001** fired on `ipv6_access_config`.
+- **COST-AWS-RISK-001** checked for a missing `max_size`, a required
+  argument, so that pattern could never fire; removed.
+- **COST-AZURE-RISK-001 / STK-AZURE-AKS-AUTOSCALE-001** read only the
+  azurerm 3 name `enable_auto_scaling`; both now accept azurerm 4+'s
+  `auto_scaling_enabled`.
+- **Duplicates**: SEC-GCP-IAM-002 and SEC-GCP-STORAGE-IAM-001 were a double
+  CRITICAL on every public bucket binding; storage is now only the
+  latter (which also covers `members`), IAM-002 keeps project and
+  dataset bindings (new `gcp_project_public_iam` fixture).
+  STK-AZURE-AKS-004 repeated SEC-AZURE-AKS-PRIVATE-001 exactly; it now
+  reports a public API server with no `authorized_ip_ranges`.
+
+New `tests/test_rule_accuracy.py` (15 tests; 12 fail on the previous
+catalogue, the 3 others are supported-runtime controls). Terragoat
+snapshot 366 → 363 (the `unlogged` false positive and two duplicates).
+
+---
+
+## Round 63 — Run Task, badge and MCP services hardened — 2026-10-26
+
+From the critical review's hosted-service findings.
+
+- **HCP Run Task server** (`integrations/run-task/`):
+  - The signature check required a `sha512=` prefix that HashiCorp's
+    docs do not describe (they give an HMAC-SHA512 of the body), so real
+    requests were likely all rejected. A bare hex digest is now
+    accepted and a prefix tolerated; the full digest is still compared
+    in constant time.
+  - It downloaded the plan, scanned it (up to 120 s) and called back
+    before replying, with blocking `requests` calls in an async handler,
+    so one run stalled every other request. It now replies 200 at once
+    (as HCP expects) and does the work in a background thread; a failure
+    is reported to the callback as `failed` rather than leaving HCP to
+    time out.
+  - The body is read with a 1 MiB cap before the signature check.
+- **Badge service** (`integrations/badge-service/`):
+  - `?label=` was inserted into the SVG unescaped (markup injection);
+    it is XML-escaped.
+  - One shared secret let any holder write every repo's badge. Uploads
+    are now signed with a per-repo key derived from the master secret
+    (`scripts/derive-key.sh`), so a repo's key writes only its badge.
+  - Signed uploads could be replayed: the signature now covers
+    `X-TFA-Timestamp`, which must be within 5 minutes and newer than the
+    repo's last accepted upload.
+  - The body is read with an 8 MiB cap before parsing or verification.
+  - `upload-score.sh` passed the secret on `openssl`'s command line (in
+    the process list); it now computes the HMAC with the key read from
+    the environment. Uploads use `TFA_BADGE_INGEST_KEY` (the repo key).
+    Nothing in this repo uploads yet, so there is nothing to migrate.
+- **MCP, Run Task and badge images** run as an unprivileged user and pin
+  their direct dependencies. The MCP image's open `mcp[cli]>=1.0` now
+  resolves to mcp 2.x, which renamed `FastMCP`: a freshly built image
+  crashed on start, unnoticed because its build-time check covered only
+  the engine. It is pinned to `mcp[cli]==1.30.0` and the build now
+  imports the server.
+- **New CI job `service-tests`** installs the three services' pinned
+  requirements and runs their tests, which every other job skipped (they
+  `importorskip` fastapi / mcp) — so a dependency bump that breaks a
+  service now fails CI.
+
+---
+
+## Round 62 — Action and CI hardening; the LSP sees spaces and unsaved edits — 2026-10-26
+
+From the critical review's delivery-surface findings.
+
+- **Every `uses:` is pinned to a commit SHA** (33 in `action.yml` and the
+  workflows, 14 actions including `softprops/action-gh-release`, which
+  holds `contents: write`, and the `docker/*` actions with
+  `packages: write`). A tag can be moved to other code; a SHA cannot.
+  Each SHA was resolved through the GitHub API and matched to an exact
+  `vX.Y.Z` tag, kept as the `# vX.Y.Z` comment Dependabot updates.
+- **`inputs.mode` goes through `env:`** like every other input (pasted
+  into `run:` it was parsed as shell), and an unknown mode fails.
+- **The release workflow rejects a tag that is not `vX.Y.Z[-pre]`**:
+  later steps paste the version into their scripts, and the `v*.*.*`
+  trigger would match `v1.2.3$(cmd)`.
+- **Language server URIs** are decoded (`urlparse` + `url2pathname`):
+  stripping `file://` alone left `%20` in, so a path with a space — and
+  every Windows path — got no diagnostics.
+- **The language server scans the editor's text**: `didOpen` /
+  `didChange` carry the full buffer (full sync), which is now what gets
+  scanned; it used to re-read the file on disk, so diagnostics lagged
+  until save. The injected scanner takes the text as a third argument.
+
+---
+
+## Round 61 — Engine bugs that missed real problems — 2026-10-26
+
+From the critical review's engine findings; each reproduced on `main`
+first, and `tests/test_engine_correctness.py` (16 tests, 15 failing on
+the previous code) pins them. No finding changes on terragoat, the
+example corpora or the demo.
+
+- **Same address in two modules**: the cross-resource index was keyed
+  `<type>.<name>`, so `aws_dynamodb_table.this` in `orders/` and `users/`
+  overwrote each other and every graph check, policy rule and the attack
+  graph saw one. A repeated name in another file is now keyed
+  `<addr>@<dir>`; `_cross_resource.resolve_ref` resolves references
+  module-first, findings keep the plain address, graph nodes show the
+  module folder.
+- **Escaped backslash**: `brace_walk` and `strip_hcl_context` checked
+  only the previous character, so `"C:\\"` never closed — a commented
+  `# password = …` after it was reported, and a precondition after it
+  was missed. Both now skip the escaped character.
+- **Heredocs in the comment stripper**: one `"` in a `user_data` script
+  flipped SEC-SECRETS-001's string state for the rest of the file;
+  heredoc text is now skipped whole (and still scanned).
+- **Precondition in a comment**: ROB-PRECONDITION-001 searched raw text,
+  so `precondition {` inside `/* */` fired; it now matches code only.
+- **`ignore_changes` counting** (ROB-DRIFT-003): lazy regexes stopped at
+  the first `}` (a `precondition {}` before it) or `]` (`tags["Owner"]`);
+  the block and list are now bracket-matched.
+- **`default_tags` in a comment** (`# TODO: add default_tags`) counted as
+  the provider block and silenced every AWS tag rule in the directory.
+- **IAM heredoc policies** with a bare `${jsonencode(var.x)}` value were
+  not JSON and were dropped whole; bare interpolations are now quoted and
+  the rest of the policy analysed.
+- **Helm provider v3** `set = [{ name, value }]` was never read
+  (SEC-K8S-HELM-001/-002 missed it); both forms now come from the parse
+  tree, with a text fallback for each.
+- **Catalogue YAML comments**: `- kind: grep  # note` kept the comment
+  as part of the kind, so a custom rule silently never ran; and a `#`
+  inside a quoted regex cut the regex. Comments now follow YAML's rule
+  (unquoted, after whitespace). All 354 shipped files load identically.
+- **Multi-line conditional in parentheses** (`? …` / `: …` on their own
+  lines) is valid HCL that python-hcl2 rejects, sending the whole file to
+  the regex fallback (a SEC-AWS-SG-001 elsewhere in it was lost). A failed
+  parse is retried once with those continuations joined, line numbers
+  kept.
+
+---
+
+## Round 60 — Rule regexes can't hang a scan — 2026-10-26
+
+The last item from the critical review. This session shipped one regex
+that backtracked exponentially (SEC-K8S-SECRET-001, Round 56: hours on a
+40-item list) and caught it only in review; custom rules from a scanned
+repo's `rules_dir` are never reviewed at all.
+
+- **Every shipped regex is probed in CI** (`tests/test_regex_safety.py`):
+  crafted HCL-like input (interpolated and quoted strings, brackets,
+  separators, behind the pattern's own leading words) repeated ~120
+  times, each probe under a 0.25 s alarm so a bad regex fails the test
+  rather than hanging it. 222 regexes in about a second; the old
+  SEC-K8S-SECRET-001 pattern and `(a+)+$` are caught.
+- **Every pattern runs under a time budget at scan time**
+  (`detect._call_with_budget`, 5 s per pattern per file,
+  `TF_ANALYZE_PATTERN_TIMEOUT` to override). Python's `re` honours SIGALRM
+  mid-match, so a runaway regex is stopped; the pattern's findings for
+  that file are dropped with a warning, listed in
+  `summary.rule_timeouts`, and the `--fail-on` gate fails (a check that
+  did not finish has not passed). A timed-out scan is not cached. Unix
+  main thread only; elsewhere unchanged. One kernel timer serves each
+  scan loop and per call only a start time is recorded — re-arming the
+  timer around each of ~400k pattern calls cost +50 % and pushed
+  `test_perf` over its budget on CI; the overhead is now ~3–9 %.
+  The timeout is a `BaseException` (like `KeyboardInterrupt`) and the
+  deadline is re-checked after each call: as an `Exception`, a handler's
+  `except Exception: continue` (policy DSL, IAM decoding) swallowed it,
+  and the next slow call then ran with the alarm already spent — a hang.
+
+---
+
+## Round 59 — Repo-controlled names stay inert in Markdown output — 2026-10-26
+
+From the critical review. File paths and resource names come from the
+scanned repository, and several Markdown outputs wrapped them in a single
+pair of backticks: a file named ``a` | ![x](evil.png) @octocat `.tf``
+closed the code span and the table cell, injecting an image and a
+mention into the PR comment.
+
+- New `_output._md_code`: an inline-code span with a fence longer than
+  any backtick run in the value, `|` escaped for tables, newlines folded.
+  Used for the PR summary's location and blast-radius resource cells, the
+  compliance table, and the fleet / trend reports (`_modes`).
+- Attack-graph Mermaid labels escape `<` / `>` (Mermaid renders HTML in
+  labels) and fold newlines.
+- The PR summary's top-findings table ranked and labelled findings by the
+  catalogue's default urgency, so an escalated CRITICAL (SSH open to the
+  world) showed as HIGH and could miss the top 3 while the banner counted
+  it as CRITICAL; it now uses the finding's effective urgency.
+
+New `tests/test_markdown_escaping.py`; its end-to-end tests fail on the
+previous code.
+
+---
+
+## Round 58 — `--apply-fixes` is safe on ordinary files — 2026-10-26
+
+From the critical review, plus one found while testing the fixes on
+terragoat. Each is pinned by `tests/test_apply_fixes_robustness.py`,
+whose behaviour tests all fail on the previous code.
+
+- **Braces in comments and strings** moved fixes: the block-end, depth
+  and argument scans counted every `{` / `}`, so `# see the closing }
+  below` inside a `tags` map put `storage_encrypted = true` into the
+  map. They now count on a code-only view of the file (`code_lines`:
+  comments, heredocs and string contents blanked), per CLAUDE.md.
+- **CRLF files** were rewritten as LF; files are now read and written
+  byte-for-byte and inserted lines use the file's own line ending.
+- **A second run overwrote `.bak`**, losing the original. Backups go to
+  the first free `.bak`, `.bak.1`, … and are created exclusively, so an
+  existing file or link is never overwritten or followed.
+- **The dry-run diff** printed every line twice (`lineterm=""` on
+  newline-terminated lines); it is now a patch `git apply` accepts.
+- **Suppressed findings were patched**: apply-fixes ran before
+  `ignore_rules` and inline / `.tf-analyze-ignore.yaml` suppressions, so
+  a database marked "cannot be replaced" got a replacement-forcing fix.
+  It now runs after them.
+- **A wrong value was never fixed**: the patcher used the rule's first
+  pattern for the resource type, so for `storage_encrypted = false` it
+  tried the "missing argument" fix, saw the argument, and gave up. It
+  now tries each of the rule's patterns until one applies (terragoat: 150
+  → 160 fixes).
+- **Multi-line list values in a fix were cut to their first line**
+  (`enabled_cluster_log_types = [`), leaving invalid HCL in 2 terragoat
+  files. Values opening with `[` or a call's `(` are now followed to the
+  matching close, like `{`. Applying every fix to terragoat now leaves
+  every file parseable (a new test).
+
+---
+
+## Round 57 — VS Code settings can't choose what runs; the Action pins its engine — 2026-10-26
+
+From the critical review's delivery-surface findings.
+
+- **VS Code extension.** `tf-analyze.pythonPath` and `tf-analyze.scriptPath`
+  are machine-scoped (User settings only): a cloned repo's
+  `.vscode/settings.json` could point them at its own program, run on
+  every save once the workspace was trusted. `tf-analyze.extraArgs` from
+  workspace settings is filtered to report-only flags; flags that write
+  files (`--apply-fixes`, `--output`), load other rules / config or reach
+  the network are dropped with a one-time warning. Recorded under
+  `[Unreleased]` in `vscode-extension/CHANGELOG.md` (no version bump).
+- **GitHub Action.** The `image` input defaulted to `:latest`, so
+  `uses: ChrisAdkin8/tf-analyze@v1.2.3` still ran whatever `main` last
+  built. The engine image now follows the action ref: `@v1.2.3` →
+  `:1.2.3`, `@v1.2` → `:1.2`, `@v1` → `:1`, a commit SHA → `:sha-<sha>`;
+  a branch or `uses: ./` falls back to `:latest` with a warning, as does
+  a derived tag that was never published (older releases). An explicit
+  `image:` / `ref:` is unchanged and still fails if it cannot be pulled.
+  `docker.yml` publishes the new major and `sha-` tags.
+- **dogfood** builds the engine image from the checkout, so PR runs test
+  the PR's engine rather than `main`'s last image (the Round 51 fix
+  showed up one merge late because of it).
+
+---
+
+## Round 56 — Azure, GCP and Kubernetes rules match the current providers — 2026-10-26
+
+Third and last batch of false-positive fixes from the critical review.
+`tests/realworld_secure/`'s known list is now **empty** (16 → 0), with
+three more secure cases (GCP signing key, default Redis cache, a `_v1`
+view binding). Facts checked against the registry docs for azurerm
+5.11, google 8.8 and kubernetes 3.4.
+
+- **SEC-AZURE-SQL-001** asked for `azurerm_mssql_server_azure_ad_administrator`,
+  which does not exist; it now wants an `azuread_administrator` block on
+  each `azurerm_mssql_server` (per server, not one repo-wide finding).
+- **STK-AZURE-SQL-TDE-001** asked for a non-existent per-database TDE
+  resource and fired on every database; TDE is on by default, so it now
+  fires on `transparent_data_encryption_enabled = false`.
+- **SEC-AZURE-VM-001** fired when `disable_password_authentication` was
+  omitted; it defaults to `true`, so only an explicit `false` fires.
+- **SEC-AZURE-STORAGE-001** checked `https_only` (an App Service
+  argument); now `https_traffic_only_enabled`. **SEC-AZURE-REDIS-001**
+  adds `non_ssl_port_enabled` and no longer fires on an omitted
+  `minimum_tls_version` (defaults to 1.2).
+- **GKE**: STK-GCP-GKE-003 repeated SEC-GCP-GKE-DBENC-001; it now fires
+  on `database_encryption { state = "DECRYPTED" }`. Binary Authorization
+  fires on `evaluation_mode = "DISABLED"` / `enabled = false`; network
+  policy on `enabled = false`, and skips Dataplane V2 clusters
+  (`datapath_provider = "ADVANCED_DATAPATH"`).
+- **STK-GCP-KMS-001** skips keys whose `purpose` is a known
+  non-rotating one (`ASYMMETRIC_SIGN`, `ASYMMETRIC_DECRYPT`, `MAC`,
+  `RAW_ENCRYPT_DECRYPT`). The list is explicit so an unresolved
+  `purpose = var.x` still fires; SEC-AWS-KMS-001's Round 55 exemption
+  (`^(?!SYMMETRIC_DEFAULT$)`) failed open the same way and now lists
+  `RSA_` / `ECC_` / `HMAC_` / `SM2` / `ML_DSA_` specs.
+- **Kubernetes**: rules now cover `kubernetes_X_v1` resources too — the
+  loader aliases `kubernetes_X` patterns, `resource_absent` accepts either
+  version (a `kubernetes_cluster_role_binding_v1` to `cluster-admin` was
+  missed). SEC-K8S-RBAC-001 reads `cluster-admin` from `role_ref` (a
+  binding merely *named* cluster-admin fired); SEC-K8S-RBAC-002 matches
+  `subject` attributes in any order. SEC-K8S-SECRET-001 fires only on
+  literal `data` values, not `var.*` references, matching its title;
+  quoted keys (`".dockerconfigjson" = "..."`) do not hide a literal. Its
+  regex alternatives are mutually exclusive: overlapping ones backtracked
+  exponentially on a crafted file (22 `"${a}"` items: 0.5 s; each one
+  more doubles it), a CI denial of service.
+- Engine: `resource_arg` with `nested_path` and no `arg` silently never
+  fired; it now works (no shipped rule relied on it).
+
+New `tests/test_azure_gcp_k8s_rule_precision.py` pins each fix both
+ways. Terragoat snapshot 367 → 366 (the GKE duplicate; Azure SQL is now
+per server).
+
+---
+
+## Round 55 — AWS rules: precise IAM, locking, KMS, listeners, S3, SSM — 2026-10-26
+
+Second batch of false-positive fixes from the critical review: all 11
+AWS entries in `tests/realworld_secure/`'s known list are gone (13 → 5
+after Round 54).
+
+- **SEC-AWS-IAM-001** was a pair of greps that fired on Deny
+  statements (the standard TLS-only bucket policy) and repeated
+  SEC-AWS-IAM-POLICY-003. It is now the JSON-policy counterpart of
+  POLICY-003 (`iam_json_policy_analysis`, `wildcard_resource`), which
+  had no JSON rule — it newly catches e.g. terragoat's
+  `aws_iam_user_policy.human_admin`.
+- **SEC-AWS-IAM-002** drops its `principals { type = "*" }` grep, which
+  fired on Deny statements; SEC-AWS-IAM-POLICY-004 covers documents.
+- **Wildcard resource** (both forms) no longer counts when every action
+  is a read-only `Describe*` / `List*` call, many of which accept no
+  resource ARN.
+- **ROB-AWS-BACKEND-001** accepts `use_lockfile = true` (Terraform 1.10+
+  native S3 locking) via a new `alternatives:` field on
+  `backend_missing_arg`, which now ignores comments: a commented-out
+  `dynamodb_table` no longer passes.
+- **SEC-AWS-KMS-001** skips keys that cannot rotate (any
+  `customer_master_key_spec` other than `SYMMETRIC_DEFAULT`).
+  `suppress_if` gains `regex:` and dotted, parse-tree `arg:` paths, on
+  `resource_arg` too, and in plan / state mode.
+- **SEC-AWS-LB-LISTENER-001**'s redirect exemption was a text match on
+  `type = "redirect"`: fmt alignment broke it, and a comment satisfied
+  it. It now reads `default_action.type`.
+- **SEC-AWS-S3-001 / -PUBLIC-BLOCK-001**: a companion that iterates the
+  bucket (`for_each = aws_s3_bucket.x`, `bucket = each.value.id`) counts.
+- **SSM**: SEC-SECRETS-002 (HIGH) now covers only parameters named like
+  a secret (`name_regex`); SEC-AWS-SSM-001 is LOW hygiene for the rest
+  (`name_not_regex`, new, also on `resource_missing_arg`), so a
+  parameter is never reported twice and an AMI id is not a HIGH.
+
+New `tests/test_aws_rule_precision.py` pins each fix both ways.
+
+---
+
+## Round 54 — Module and supply-chain rules stop firing on pinned code — 2026-10-26
+
+The noisiest false positives from the critical review: these fired HIGH
+on almost any repository that used modules, pinned or not. Each module
+problem now has exactly one rule.
+
+- **MOD-SUPPLY-003** (registry module without `version`) is a
+  `module_block_missing_arg` check on the block instead of a grep on the
+  source line, which could not see `version` and fired on every registry
+  module. Covers private-registry hosts and `//subdir` sources.
+- **MOD-PIN-001** is git-hosted sources (`git::`, `github.com/`,
+  `bitbucket.org/`) without `?ref=`; its greps matched pinned sources
+  too. Its registry pattern duplicated MOD-SUPPLY-003 and is removed.
+- **SEC-SUPPLY-001** looked for a module *argument* `ref`, so it fired
+  on every git source including SHA pins and its own fix. It now fires
+  when `?ref=` names a branch (`main`, `develop`) rather than a 40-char
+  SHA or a version tag; a missing ref is MOD-PIN-001.
+- **MOD-STALE-001** had a static pattern that matched any registry
+  source. New pattern kind `registry_check` (documented in
+  `catalog/README.md`) reports nothing offline; findings come only from
+  `--check-registry`. The offline-unassertable `mod_stale_version`
+  fixture is removed.
+- **SEC-PROVIDER-001** matched any `">= X…"` constraint, including the
+  bounded `">= 5.0, < 6.0"` its fix recommends. It now fires only when
+  the constraint has no `<` / `~>` part.
+- **SEC-PROVISIONER-001**'s fix no longer contains a `local-exec`
+  provisioner.
+
+Both ratchet lists shrink: `KNOWN_SELF_TRIGGERS` is empty (5 → 0) and
+3 of the 16 known false positives in `tests/realworld_secure/` are gone,
+which gains two cases (`git_module_tag_pin`,
+`provider_bounded_constraint`). Terragoat snapshot recalibrated
+(371 → 367: one finding per unpinned module instead of three).
+
+---
+
+## Round 53 — Score v2: honest points, no padding — 2026-10-26
+
+Fixes to the Round 50 size-aware score (`scoring_version` stays 2).
+
+- `--explain-score` printed each urgency's catalogue weight ("−3 pts"
+  for a MEDIUM) even where the size factor makes a fix worth 0.6. Rows
+  gain `points`, the real penalty a fix removes, and the text shows it;
+  `weight` is unchanged for JSON readers.
+- The size factor counted every `resource` block, so 500 empty
+  `terraform_data` blocks lifted a score from 50 to 61.
+  `resources_scanned` now counts only resources of a type at least one
+  rule checks (terragoat: 113 → 94).
+- Hygiene stays mess per assessed resource, so adding a real resource
+  cleaner than average (or deleting one dirtier than average) can still
+  move the score by about a point — documented in SKILL.md / README. A
+  property test pins that fixing a finding never lowers the score.
+
+---
+
+## Round 52 — Guards that check answers, not just shapes — 2026-10-26
+
+The suite passed while a review found dozens of wrong answers, because
+it mostly checked that output kept its shape. Three new guards:
+
+- **SARIF is validated against the official 2.1.0 schema**
+  (`tests/test_sarif_schema.py`, schema vendored at `tests/schemas/`).
+  It caught 964 errors per run: every `relationships[].target` carried a
+  `name`, which a `reportingDescriptorReference` does not allow. Removed;
+  the taxon's name is still in `taxonomies`. `jsonschema` joins the dev /
+  CI test dependencies.
+- **Every rule's `fix_hcl` must not trigger that rule**
+  (`tests/test_fix_hcl_self_check.py`), covering the grep / module /
+  corpus kinds the `_clean` fixtures skip. Five known self-triggers are
+  strict xfails, so the list can only shrink.
+- **Secure real-world idioms must not draw HIGH / CRITICAL findings**
+  (`tests/test_realworld_secure.py`, 12 cases under
+  `tests/realworld_secure/`: pinned modules, native S3 locking, Deny
+  statements, `for_each` companions, fmt-aligned arguments …). 16 known
+  false positives across 11 cases are listed with their cause; the list
+  is exact both ways. The directory is in `.tf-analyze.yaml`
+  `ignore_paths`.
+
+---
+
+## Round 51 — Fail-open gates closed — 2026-10-26
+
+A critical review found ways a scan that should fail `--fail-on` exited 0,
+and one way scanning an untrusted repo could write outside it.
+
+- `--attack-graph` (on by default in the GitHub Action) rebuilt each
+  finding's urgency from the catalogue default, dropping structured
+  escalations: SSH open to the world fell from CRITICAL to HIGH and passed
+  `--fail-on CRITICAL`. Tiers now move from the current urgency, and an
+  escalated finding is never demoted.
+- `--baseline` hid a finding that got worse (port 443 → 22, HIGH →
+  CRITICAL). A paired finding whose urgency rose is now retained. Older
+  baselines without `urgency` still suppress as before.
+- `--mode fleet` always exited 0; it now applies `--fail-on` across every
+  target.
+- A `.tf` (or workflow / tfvars) file that could not be read was only a
+  warning; under `--fail-on` it now fails the gate. Fleet mode warns
+  instead of skipping silently.
+- `--cache` stored `--plan-json` / `--state-json` findings, so a later run
+  without them replayed stale findings. They are no longer cached.
+- `--apply-fixes apply` refuses a symlinked source file or `.bak`, or a
+  file resolving outside the scan target (a repo shipping
+  `main.tf.bak -> ~/.bashrc` could overwrite that file).
+- New `--no-project-config` ignores `.tf-analyze.yaml`, whose
+  `ignore_rules` a pull request controls. For untrusted PRs pass
+  `--no-project-config --no-suppress` (Action: `extra-args`).
+
+---
+
+## Round 50 — Size-aware score; one source for the version — 2026-10-26
+
+### Score (scoring version 2)
+The score was `100 - Σ weights`, so a large estate was graded F for the
+sheer number of hygiene findings it had, and `--explain-score` promised
+ceilings it could not reach.
+
+- `penalty = 15·CRITICAL + 7·HIGH + (3·MEDIUM + 1·LOW) / size_factor`,
+  `size_factor = max(1, √(resources_scanned / 20))`. CRITICAL and HIGH
+  are each a concrete exposure and cost the same in any repository;
+  MEDIUM and LOW are judged relative to size. Up to 20 resources the
+  score is unchanged; 20 MEDIUM findings across 400 resources score
+  86 (B) instead of 40 (D).
+- The summary gains `resources_scanned`, `size_factor` and `penalty`;
+  `scoring_version` is 2.
+- `--explain-score` projects from the unclamped penalty. It added a
+  fixed finding's weight back onto a score already clamped at 0, so 60
+  CRITICALs reported "ceiling if you fix the top 5: 35 (D)"; it is 0.
+
+### Version
+The version lived in four places with four values (`pyproject` 0.2.6,
+SARIF `tool.driver.version` 1.2.0, LSP `serverInfo` 0.1.0, release tag).
+
+- `scripts/_meta.py` holds `__version__`; the package build reads it
+  (`[tool.setuptools.dynamic]`), as do SARIF, the LSP server and the
+  JSON report (new `tool_version`).
+- New `--version` flag.
+- The release workflow refuses a tag that does not match `_meta.py`.
+
+---
+
+## Round 49 — Baselines survive code moving and a new checkout — 2026-10-26
+
+`--baseline` matched findings on `(id, file, line, resource)` with
+absolute paths, so a ratchet broke on ordinary edits: adding one comment
+line at the top of a file turned every baselined finding below it into a
+"new" one (failing `--fail-on`), and running the same code from another
+directory matched nothing.
+
+- Findings now pair by rule, **file relative to the scan target** and
+  resource — not the line. Several findings with one key pair by exact
+  line first, then nearest line, so fixing one of two identical findings
+  still shows as resolved. `--compare` uses the same pairing
+  (`_baseline._pair_findings`).
+- JSON reports record their scan `target`, so a baseline written in one
+  checkout is read back relative to its own root. A report without one
+  (older reports, the VS Code baseline file) is read relative to the
+  current target, with a path-ending fallback for another checkout.
+- Module-level findings (`<module:repo>`) no longer depend on the folder
+  name.
+- VS Code extension: the baseline file's suppress / unsuppress key drops
+  the line to match, so unsuppressing a finding that moved removes the
+  record written at its old line.
+
+---
+
+## Round 48 — Per-resource companion rules (`resource_missing_companion`) — 2026-10-26
+
+`resource_absent` fires only when a resource type is missing from the
+whole repository, so rules that need one companion *per* resource were
+satisfied by any single one: one `aws_s3_bucket_public_access_block`
+anywhere passed every bucket, one `aws_flow_log` every VPC, one
+diagnostic setting every Key Vault / load balancer / NAT gateway.
+
+New kind `resource_missing_companion` fires on each `resource` that no
+`companion` in the same module points at through `via` (by reference or
+the same literal; `via` may be a list). `exempt_if_companion` exempts a
+resource another one points at — a bucket that is some
+`aws_s3_bucket_logging`'s `target_bucket` is a log destination and need
+not log its own access. 21 rules are converted:
+
+- AWS: SEC-AWS-S3-PUBLIC-BLOCK-001, SEC-AWS-S3-LOGGING-001,
+  SEC-AWS-VPC-FLOWLOGS-001, SEC-AWS-ECR-002, SEC-AWS-WAF-001,
+  ROB-AWS-SECRETSMANAGER-001, STK-AWS-EKS-004, STK-AWS-ROUTE53-001.
+- Azure: SEC-AZURE-SQL-AUDIT-001, SEC-AZURE-SQL-ATP-001,
+  SEC-AZURE-LOGGING-001, SEC-AZURE-APIM-001, SEC-AZURE-APIM-002,
+  SEC-AZURE-PRIVATE-DNS-001, STK-AZURE-NSG-FLOWLOG-001 (`via` both
+  `network_security_group_id` and azurerm v4's `target_resource_id`),
+  STK-AZURE-SQL-TDE-001, STK-AZURE-LB-001, STK-AZURE-NAT-001,
+  STK-AZURE-LOGIC-APP-001.
+- GCP: ROB-GCP-FILESTORE-001, STK-GCP-MIG-002.
+
+Account- / project-level singletons stay `resource_absent` (GuardDuty,
+Security Hub, password policy, Defender, audit config, …), as do
+SEC-AZURE-SQL-VULN-001 (it links through the alert policy, not the
+server) and SEC-AZURE-SQL-001 (its companion resource is configured
+inline in current azurerm).
+
+Findings now name the resource and its line instead of
+`<absent: TYPE>` at the target: across `fixtures/`, `examples/` and
+`demo/`, 12 repo-level findings become 155 per-resource ones; terragoat
+371 → 373.
+
+---
+
+## Round 47 — S3 rules accept AWS provider v4+ split resources — 2026-10-26
+
+AWS provider v4 split S3 bucket settings into sibling resources
+(`aws_s3_bucket_versioning`, `aws_s3_bucket_server_side_encryption_configuration`,
+…). Three rules false-positived on modern code:
+
+- **SEC-AWS-S3-001** (HIGH) and **ROB-AWS-S3-001**: their legacy pattern
+  demanded the pre-v4 inline block on `aws_s3_bucket`, so a bucket
+  configured the modern way was still reported. New `resource_missing_arg`
+  option `unless_companion: {resource, via}` skips a bucket that a
+  companion in the same module points at — by reference
+  (`bucket = aws_s3_bucket.x.id`, `.bucket`, `[0].id`) or by the same
+  literal bucket name — across files (new `InFileCtx.module_resources`).
+  A bucket with neither form still fires.
+- **SEC-AWS-LOG-RETENTION-001** (HIGH) fired on every bucket:
+  `resource_missing_arg` ignored the pattern's `name_regex`. It now limits
+  the rule to resources whose label, `name` or `bucket` matches (here:
+  audit / log / cloudtrail buckets).
+- Plan and state mode (`--plan-json`, `--state-json`) honour both
+  options; companions are linked through the plan's `configuration`
+  references (planned values lose them) or, in state, by value.
+- `SEC-AWS-S3-001_clean` / `ROB-AWS-S3-001_clean` now declare the bucket
+  (in a separate file) — before, they had no `aws_s3_bucket`, so this
+  false positive could not be caught.
+
+Corpus: 26 log-retention findings on non-log buckets (4 in terragoat)
+and one duplicate versioning finding are gone; nothing new fires.
+
+---
+
+## Round 46 — Variable lookups: comments, nested keys, .tfvars, several callers — 2026-10-26
+
+`var.X` / `local.X` resolution had four false-negative gaps, each a case
+where a rule saw the wrong value (or none):
+
+- **Trailing comments after a value**: `default = true // note` (and
+  `/* */`) kept the comment, so the value never matched. The comment strip
+  in `block_arg_value` only ran when the value held a quote; it is now
+  `strip_hcl_context` (string-aware, all three comment forms, and no
+  single-quote handling — HCL has none).
+- **Nested keys shadowing locals**: `locals { pub = true; defaults = { pub
+  = false } }` resolved `local.pub` to `false` — every `name =` line was
+  read, at any depth. Locals and module inputs are now read from
+  top-level assignments only.
+- **`.tfvars` files were ignored.** `terraform.tfvars`, `*.auto.tfvars`
+  and their `.json` forms are now layered over defaults in Terraform's
+  precedence order (later wins). A tfvars file symlinked from outside its
+  directory is not read.
+- **A child module with several callers took the last caller's inputs**,
+  so `public = true` from one caller could be hidden by `public = false`
+  from another. Each distinct set of caller inputs is now its own variable
+  table (up to 8), the child is scanned once per table, and duplicate
+  findings are dropped. Call cycles terminate.
+
+Corpus findings are unchanged.
+
+---
+
+## Round 45 — Housekeeping: Apache-2.0 everywhere, dev deps, ROB-VERSION-001 — 2026-10-26
+
+- **Licence is Apache-2.0 everywhere.** `LICENSE` (and the VS Code
+  extension's copy) have always been Apache-2.0, but `pyproject.toml`, the
+  README badge / layout / License section and a launch doc said MPL-2.0.
+  The VSIX is now packaged with its `LICENSE` (`vsce package` without
+  `--skip-license`).
+- **ROB-VERSION-001 false positive fixed.** `1\.[0-5]` matched the `1.1`
+  prefix of `1.10`, so a current floor (`>= 1.10.0`, `~> 1.10`) was
+  reported as "too old" — including all three terragoat clouds. New clean
+  fixture `ROB-VERSION-001_clean`.
+- **Dev extra matches CI**: adds `pytest-timeout` and `pyyaml` (two test
+  modules import `yaml`; without it `pytest -n auto` reported a spurious
+  failure).
+- **Stale docs**: README catalogue/fixture counts (354 rules; 360 + 264
+  fixtures), SKILL.md totals (354 = 352 active + 2 stubs; cross-cloud 63)
+  and its removed `--suppress` flag, VS Code extension README rule counts
+  (352), and CLAUDE.md's `--use-hcl2` note (the parser is vendored and
+  always on).
+
+---
+
+## Round 44 — SARIF that code scanning can use — 2026-10-26
+
+- **Repo-relative URIs.** Every `artifactLocation.uri` was the absolute
+  local path (`/Users/…/main.tf`, `/workspace/…` in the Action), which
+  GitHub Code Scanning cannot map to a file in the repository. URIs are
+  now relative to the repository root (the nearest ancestor of the target
+  holding `.git`, else the target), percent-encoded, with
+  `uriBaseId: "%SRCROOT%"` declared in `originalUriBaseIds`. Parse-fallback
+  notifications use the same form.
+- **Fingerprints no longer collide.** `tfAnalyze/v1` (`id|file|resource`)
+  was identical for file-level findings of one rule in one file (e.g. two
+  `MOD-PIN-001`), so code scanning merged them into one alert. Findings
+  that share a key are now numbered in line order (`|#n`, the first one
+  unchanged); `tfAnalyze/v1-resource` is emitted only when there is a
+  resource. Fingerprints use the repo-relative path, so they no longer
+  depend on where the repo is checked out — and still not on the line, so
+  alerts survive code moving.
+- **Result messages** carry the rule title (`Security group allows … (aws_security_group.x)`)
+  instead of `Finding <ID> on <resource>`.
+
+Upgrade note: because fingerprints were built from absolute paths,
+existing code-scanning alerts are re-keyed once (closed and reopened)
+on the first upload after this change.
+
+---
+
+## Round 43 — IAM policy rules read the parse tree — 2026-10-26
+
+The IAM rules missed the most common ways policies are written. Policies
+are now read from the parse tree (`scripts/_iam_policy.py`) into one
+statement model shared by both rule kinds:
+
+- **`jsonencode({...})` in `terraform fmt` style** (newline-separated
+  attributes, no commas — the registry's own examples) and **any policy
+  containing a reference** (`Resource = aws_s3_bucket.b.arn`) were
+  dropped silently by the regex HCL→JSON conversion. Terragoat's
+  `aws_iam_user_policy.human_admin` (`Action = "*"`, `Resource = "*"`)
+  now raises SEC-AWS-IAM-JSON-001/003.
+- **Heredoc and quoted-JSON policies** and **`inline_policy` blocks** on
+  `aws_iam_role` are analysed (`iam_json_policy_analysis`, new `args`
+  pattern field).
+- **`dynamic "statement"`** in `aws_iam_policy_document` is analysed;
+  policy-document findings point at the `statement` line (they were one
+  line early, on the `data` header).
+- **SEC-AWS-IAM-002** (CRITICAL) is a structured check of
+  `aws_iam_role.assume_role_policy` instead of two text patterns, so
+  `Principal = { AWS = "*" }` / `{ AWS = ["*"] }` are caught.
+- **SEC-AWS-IAM-JSON-004** now covers resource policies — S3 bucket, SNS,
+  SQS, KMS key, Secrets Manager, ECR, Glacier and OpenSearch policies —
+  where a public principal actually exposes a resource.
+- Expressions stay `"${...}"` and never match a literal `"*"`: a wildcard
+  behind a variable is not reported. Deny statements never fire.
+- The regex fallback (unparseable files) handles the same `fmt` style,
+  comments and references, and shares the statement checks with the tree
+  path.
+
+---
+
+## Round 42 — Scanned content can no longer hide findings or escape the target — 2026-10-26
+
+The scanner runs on untrusted Terraform (a pull request from a fork, a
+repo opened in VS Code). Each of these let scanned content change the
+result or reach outside the target:
+
+- **Scan cache moved out of the target.** `--cache` defaulted to
+  `<target>/.tf-analyze-cache.json` and trusted it whenever its corpus
+  hash matched — a hash anyone can compute from public inputs. A pull
+  request could commit that file with `"findings": []` and score the repo
+  clean. The default is now a per-target file under the user cache dir
+  (`--cache-file` still overrides). Cache writes go through a temp file
+  and a rename, so a symlink at the cache path is replaced, not written
+  through.
+- **HTML report: attack-graph JSON can't close its `<script>`.** Node
+  names come from file paths and resource names; a file named
+  `</script><img onerror=…>.tf` injected script into the report (and the
+  VS Code webview). `<`, `>`, `&` and U+2028/2029 are now escaped.
+- **Symlinks that resolve outside the target are skipped** (with a
+  warning) in the main scan, `--verify-fixed`, extra files and fleet
+  mode. They were read — leaking content through parse errors and the
+  JSON/SARIF output (e.g. `x.tf -> ../.git/config` in CI) — and
+  `--apply-fixes` wrote through them. Symlinks within the target are
+  still scanned.
+- **Inline `# tf-analyze:ignore` only counts in a real comment.** The
+  marker inside a string value (e.g. a `description`) or a heredoc script
+  silenced findings without looking like a suppression in review. New
+  `_hcl.comments_only` lexes like the block finder.
+
+---
+
+## Round 41 — CI gating fails closed — 2026-10-26
+
+Each of these let a CI gate pass having checked nothing (or less than it
+was asked to):
+
+- **A missing or non-directory `--target`** scanned nothing and exited 0
+  with grade A, so a typo in a CI path switched the gate off. It is now
+  an error (exit 2). A second `--target` outside `--mode fleet` (only the
+  first was ever scanned) is an error too, as is a missing fleet target;
+  a directory with no `.tf` files warns.
+- **A failed `--diff-base` diff** (unknown ref — the default in a shallow
+  CI checkout — no git, or a git timeout) returned "no changed files",
+  so the run scanned nothing and passed. `get_diff_files` now returns
+  `None` for a failed diff, distinct from an empty diff, and the scan
+  falls back to all files with a warning.
+- **`--mode pr-review` ignored `--fail-on`**; it now gates like a normal
+  scan.
+- **`--fail-on INFO` never saw INFO findings**: they were dropped from
+  output (without `--show-info`) before the gate ran. The gate now runs
+  on the findings from before that filter. Findings with no catalogue
+  entry are gated on their own urgency instead of skipped.
+- **New `--fail-on-parse-error`**: exit 1 when any file could only be
+  scanned in the regex fallback mode. Opt-in; parse failures were, and
+  by default still are, a warning.
+
+---
+
+## Round 40 — `*.tf.json` files are scanned — 2026-10-26
+
+Terraform's JSON syntax was skipped entirely (`rglob("*.tf")`). Each
+`.tf.json` is now rendered as the equivalent native HCL
+(`scripts/_tfjson.py`) and scanned by every existing rule; findings keep
+the `.tf.json` path and point at the JSON line of the key.
+
+- Rendering follows the JSON-syntax spec for block labels and repeated
+  blocks (lists of bodies); `provisioner` / `dynamic` / `backend` take a
+  label; `"//"` comment properties are ignored. Without provider schemas,
+  an object is a nested block unless its key is a well-known map
+  (`tags`, `labels`, …) or it has a non-identifier key; a list of objects
+  is always a block.
+- A string that is exactly one interpolation (`"${var.x}"`) is emitted as
+  the bare expression, as Terraform reads it — only when its brackets
+  balance on their own, so JSON content cannot open or close a block.
+  Invalid labels and attribute names are dropped, never spliced in.
+- Line numbers: every rendered line records its JSON line and findings
+  are remapped after detection (main scan, `--mode fleet`,
+  `--verify-fixed`).
+- Discovery covers `.tf.json` in the main scan, `--diff-base`, fleet and
+  verify-fixed; a `file_glob` aimed at a `.tf` file also matches its
+  `.tf.json` twin (`**/versions.tf` → `versions.tf.json`).
+- `--apply-fixes` reports but never patches `.tf.json` files (an HCL
+  snippet cannot be spliced into JSON). Invalid JSON is a `WARN: cannot
+  read` and the rest of the target is still scanned.
+- Parity check: every fixture rendered to Terraform JSON from its parse
+  tree scans identically to the `.tf` on 621 of 630 directories; the rest
+  are `jsonencode(...)` arguments the parser re-renders in a form no
+  hand-written `.tf.json` uses, plus two `.tf`-side bugs (a `var.X`
+  mentioned only in a comment counts as a use; a trailing comment after
+  `default = false` hides the value).
+
+Not covered: the LSP server and `--mode trend` still read `.tf` only.
+
+---
+
+## Round 39 — Block discovery by lexer, not header regex — 2026-10-26
+
+`find_blocks` / `find_simple_blocks` now locate blocks with one lexer pass
+per file (`_hcl._block_index`, memoised) that understands strings,
+`${…}` / `%{…}` templates, comments and heredocs. Callers keep the same
+API: their header regex is matched against the canonical header to pick
+the block kind and supply `groups`. Each of these was a silent false
+negative or wrong location before:
+
+- **A `#` or `//` inside a heredoc** (e.g. `$${HOSTNAME#ip-}` in
+  `user_data`) no longer swallows the block's closing `}` and drops the
+  whole resource. `brace_walk` now skips heredoc bodies too.
+- **A commented-out copy of a resource** (`/* resource … */`) is no
+  longer a block. It used to make the real resource's key ambiguous,
+  turning the parse tree off for it (`SEC-AWS-SG-001` was missed), and
+  produced false positives of its own.
+- **Unquoted labels** (`resource aws_security_group sg {`) and a
+  **comment between the keyword and its labels** are recognised.
+- **`start_line` is the keyword's line.** The old `^\s*` swallowed
+  preceding blank lines, so ~1,760 of ~4,300 findings across
+  `fixtures/`, `examples/` and `demo/` pointed at a blank or comment line
+  above the block, and a `# tf-analyze:ignore` on the header line after
+  a blank line was not applied. The set of findings is otherwise
+  unchanged.
+- **Unclosed blocks cost one pass, not one walk to EOF each.** 3,000
+  unclosed `resource {` lines took ~450 s; now ~0.2 s.
+
+Not covered here: `*.tf.json` files (scanned from Round 40).
+
+---
+
+## Round 38 — Parser migration complete: top-level lookups, text-scan hygiene, literal-only `count = 0` — 2026-10-26
+
+Step 5a of `tasks/hcl-parser-migration.md`.
+
+- **`block_arg_value` reads only a block's own (top-level) argument**,
+  never one inside a nested block, map, string, heredoc or comment. This
+  gives every remaining text-based lookup the same semantics as the parse
+  tree in one place. An instrumented run over all 637 fixture / example
+  directories found one call site whose answer changed — a bug: a Cloud
+  Armor `rate_limit_threshold { count = 100 }` was read as the resource's
+  `count`, so a nested `count = 0` would have skipped the resource for
+  every rule.
+- **Lists in bodies containing a heredoc are read whole.** The heredoc
+  path returned only a list's first element, so e.g. an IAM statement's
+  `actions = ["s3:GetObject", "*"]` lost its wildcard whenever the same
+  body held a heredoc.
+- Structural text-scan rules (module sources, version constraints,
+  `data` / `provisioner` blocks, …) no longer match commented-out code.
+  Removes a `SEC-PROVISIONER-001` false positive on a comment line in
+  terragoat.
+- `SEC-DATASOURCE-003`, `ROB-DRIFT-001/002`, `MOD-SUPPLY-004`: the
+  pattern no longer reaches back across blank lines, so findings report
+  the `data` / `lifecycle` line itself (not the blank line above) —
+  baseline keys for `SEC-DATASOURCE-003` move by one line.
+- README: the MITRE / CWE / D3FEND coverage badge was stale (69/53/40%);
+  it now reads 80/68/47% and is checked by `tests/test_readme_drift.py`.
+  The hand-written test-count badge (1,153 — wrong) is removed; the CI
+  badge reports test status.
+- **A resource is skipped only for a literal `count = 0`.** A count that
+  reaches 0 only through a variable default (e.g.
+  `count = var.enabled ? 1 : 0`, `default = false`) is now checked by
+  every rule, because tfvars / `-var` can enable it at apply time.
+  Expect new findings on optional, disabled-by-default resources in
+  modules (bundled corpora: 8 on the `unguarded_count_ref` fixture).
+- Structural text scans now use the HCL-aware comment / heredoc lexer
+  (`code_only: true`) instead of the older comment stripper, so text
+  inside heredocs no longer matches them either.
+
+**Upgrade note — baselines:** besides the `SEC-DATASOURCE-003` line
+move above, resources whose count depends on a variable now produce
+findings that baselines won't contain.
+
+---
+
+## Round 37 — Structured network exposure rules; engine-evaluated escalation — 2026-10-25
+
+Step 4 of `tasks/hcl-parser-migration.md`.
+
+- **`SEC-AWS-SG-001` and `STK-AZURE-NSG-001` no longer text-search the
+  whole file.** A new inbound-exposure model (`scripts/_network.py`)
+  covers `aws_security_group` (`ingress` blocks and `ingress = [{...}]`),
+  `aws_security_group_rule` (`type = "ingress"`),
+  `aws_vpc_security_group_ingress_rule`, Azure NSGs and NSG rules
+  (Inbound + Allow), and GCP firewalls. Egress, outbound and deny rules,
+  private ranges, comments and heredoc text no longer match; `var.X` /
+  `local.X` sources are resolved, so `cidr_blocks = var.open` with a
+  world-open default is caught. `firewall_open_port` (used by the GCP
+  network rules) gains a `resource:` key and the same model.
+- **Structured escalation.** `escalation:` items with a `match:` are now
+  evaluated by the engine: open SSH / RDP raises `SEC-AWS-SG-001` and
+  `STK-AZURE-NSG-001` to CRITICAL, and `allUsers` /
+  `allAuthenticatedUsers` raises `SEC-GCP-IAM-001`. Free-text
+  `condition:` items stay judgement-pass metadata. Escalations are
+  validated at catalogue load.
+- Every remaining `grep` pattern records why it stays a text scan
+  (`text_scan:`), enforced by a test.
+- All six parser-migration probes now pass.
+- The network rules fail closed: a rule whose `type` / `direction` /
+  `access` can't be resolved is treated as possibly inbound and allowed,
+  and only a literal `count = 0` skips a resource.
+- False positives removed in the bundled corpora: comment lines matched
+  by the old NSG grep, and a CRITICAL `SEC-GCP-NETWORK-001` on an
+  IAP-only firewall (`35.235.240.0/20`) whose comment mentioned
+  `0.0.0.0/0`.
+
+**Upgrade note — baselines:** `SEC-AWS-SG-001` / `STK-AZURE-NSG-001` now
+report one finding per exposed resource at the resource's first line
+(previously one per matching line, egress included). Baseline entries for
+these two rules will not match and the findings will show as new once;
+re-snapshot the baseline after upgrading.
+
+---
+
+## Round 36 — Value checks on the parse tree; plan mode agrees with static — 2026-10-25
+
+Step 3 of `tasks/hcl-parser-migration.md`.
+
+- **`resource_arg` and `hcl_attr` read values from the parse tree**,
+  rendered back to the HCL text their regexes were written against
+  (`_hcl.render_hcl`: strings unquoted, references bare, `true`/`false`,
+  lists and maps in HCL syntax). A golden test checks the rendering
+  matches the old text lookup on every fixture. Values are top-level, a
+  dotted path may be given in `arg` or `nested_path`, and through a
+  repeated block the rule fires if any copy matches (`fire_if_absent`:
+  if any copy lacks it). The regex fallback follows the same rules.
+- **Five patterns that had never fired now work.** They used a dotted
+  `arg` the old lookup couldn't match: `ROB-AWS-S3-001` (versioning
+  `Suspended`/`Disabled`), `ROB-AZURE-STORAGE-001` (soft-delete days),
+  `SEC-AWS-SSRF-001` (`http_tokens = "optional"`),
+  `STK-AZURE-FUNCTION-001` (EOL Python), `STK-GCP-FUNCTIONS-001` (EOL
+  gen-2 runtime). New true positive in terragoat:
+  `aws_instance.imds_v1_explicit` → `SEC-AWS-SSRF-001`.
+- **Plan / state mode uses the same rules as static mode.** It used to
+  compare Python's `True` / `['a']`, ignore dotted paths and
+  `nested_path` on `resource_arg`, and look only at the first copy of a
+  repeated block — 52 disagreements with static mode on literal-only
+  fixture resources, both missed findings (e.g. `ROB-AWS-ALB-001` on
+  `enable_deletion_protection = false`) and false positives. Now none.
+- **`resource_body_contains` ignores comments and heredoc bodies**, so
+  commented-out code and inline scripts / policy documents can't match.
+- Corpus diff vs Round 35: no finding removed; the two additions above
+  (`SEC-AWS-SSRF-001` in terragoat, `ROB-AWS-S3-001` on the
+  `aws_s3_no_versioning` fixture's `Suspended` versioning resource).
+
+---
+
+## Round 35 — Parse tree for presence checks; parse-failure reporting — 2026-10-25
+
+Step 2 of `tasks/hcl-parser-migration.md`.
+
+- **`resource_missing_arg` reads the parse tree.** Each `.tf` file is
+  parsed once (memoised) and every resource gets its parsed settings.
+  `arg` is now top-level only: a same-named key in a nested block, a map
+  such as `tags`, a string, a heredoc or a comment no longer satisfies
+  it. Fixes e.g. a log group passing `COST-AWS-RISK-001` /
+  `OPS-AWS-CWL-001` because it had a `retention_in_days` *tag*.
+- **`nested_path` walks map attributes** (`tags.cost_center` now matches
+  `tags = { cost_center = ... }` — the `docs/custom-rules.md` example
+  previously fired on every resource) and list-of-objects attributes.
+  When a segment is a repeated block, every copy must have the rest of
+  the path; new pattern key `instances: any` opts out
+  (`SEC-AWS-WAF-002` uses it).
+- `STK-K8S-INGRESS-001` (`spec.tls`) and `STK-GCP-CLOUDSQL-IAMAUTH-001`
+  (`settings.database_flags`) now use `nested_path`; they relied on the
+  old any-depth matching.
+- **Files the parser can't read are still scanned** by a regex fallback
+  that follows the same rules, and are reported as a tool diagnostic
+  (not a finding, no score impact): stderr `WARN`, JSON
+  `summary.parse_fallback_files`, a SARIF tool-execution notification,
+  a one-line notice in text / HTML / pr-summary, and an Information
+  diagnostic in the LSP. Kept across `--cache` hits.
+- The resource index is built once per scan instead of twice.
+- New CI job runs the whole suite with the regex fallback forced
+  (`TF_ANALYZE_TEST_FORCE_FALLBACK=1`).
+- Corpus diff vs Round 34: no finding removed on `examples/` or
+  `fixtures/`; additions only on the new fixtures and probe P5.
+
+---
+
+## Round 34 — Vendored HCL parser, always on — 2026-10-25
+
+Step 1 of `tasks/hcl-parser-migration.md`. The engine now ships its own
+copy of `python-hcl2` 7.2.1 and `lark` 1.3.1 in `scripts/_vendor/` and
+always uses it, so every surface (CLI from a checkout, Claude Code skill,
+Docker images, VS Code `.vsix`, pip wheel) runs the same parser with no
+`pip install`. Previously the parser was optional: CI and the public
+scanner ran the regex-only path while the Docker image used `python-hcl2`
+4.3.5.
+
+- `scripts/vendor_deps.py` refreshes `_vendor/` from pinned versions and
+  checks each wheel's sha256; never edit `_vendor/` by hand.
+- lark's built-grammar cache sits next to the vendored `parser.py`
+  (gitignored), else in the per-user cache dir, never in a shared temp dir.
+  Docker images and the `.vsix` ship it pre-built.
+- **Deprecated:** `--no-hcl2`, `--use-hcl2`, `TF_ANALYZE_NO_HCL2`,
+  `TF_ANALYZE_USE_HCL2` are now no-ops that print a notice, hidden from
+  `--help`. They will be removed in the next minor release.
+- `--cache` files move to format v2; the cache key now covers the engine
+  source and parser versions, so old caches are rebuilt once.
+- No detection results change: every finding on `examples/` and
+  `fixtures/` is identical to the previous release.
+- New strict-xfail probe fixtures `fixtures/parser_probe_p1`–`p6` record
+  known false positives/negatives that later migration steps fix.
+
+---
+
 ## Round 33 — Policy-as-code DSL (`kind: policy`) — 2026-05-30
 
 Closes the long-standing #1 capability gap: custom rules could only match a

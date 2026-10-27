@@ -21,6 +21,7 @@ field interpretation.
 """
 from __future__ import annotations
 
+import ipaddress
 import re
 
 from _hcl import (
@@ -29,9 +30,13 @@ from _hcl import (
     block_arg_value,
     block_has_arg,
     block_has_nested_path,
+    resource_has_path,
+    resource_values_at,
+    mask_comments_and_heredocs,
     brace_walk,
     strip_hcl_context,
 )
+from _catalog import kubernetes_type_aliases
 from detect import (
     InFileCtx,
     CorpusCtx,
@@ -93,6 +98,55 @@ def _detect_data_source_present(c: InFileCtx) -> list[dict]:
     return out
 
 
+def _name_selected(pat: dict, blk: dict) -> bool:
+    """``name_regex`` / ``name_not_regex``: whether the resource's label,
+    ``name`` or ``bucket`` matches (resp. none of them matches)."""
+    names = (
+        blk["groups"][1],
+        block_arg_value(blk["body"], "name") or "",
+        block_arg_value(blk["body"], "bucket") or "",
+    )
+    if pat.get("name_regex") and not any(
+        re.search(pat["name_regex"], n) for n in names
+    ):
+        return False
+    if pat.get("name_not_regex") and any(
+        re.search(pat["name_not_regex"], n) for n in names
+    ):
+        return False
+    return True
+
+
+def _suppressed_by(spec: dict | None, blk: dict, var_defaults: dict) -> bool:
+    """Whether ``suppress_if: {arg, equals | regex}`` holds for a resource:
+    a value of `arg` (variables resolved; may be a dotted path such as
+    ``default_action.type``, where any instance counts) equals the
+    literal, case-insensitively, or matches the regex. Read from the
+    parse tree, so `terraform fmt` alignment does not matter."""
+    if not spec or not spec.get("arg"):
+        return False
+    want = str(spec.get("equals", "")).lower().strip("\"'")
+    for value in resource_values_at(blk, spec["arg"]):
+        actual = str(_resolve_var_ref(value, var_defaults)).strip("\"'")
+        if "regex" in spec:
+            if re.search(spec["regex"], actual):
+                return True
+        elif want and actual.lower() == want:
+            return True
+    return False
+
+
+def _repo_has(pat: dict, var_defaults: dict) -> bool:
+    """``unless_repo_has: T`` — whether a resource of type ``T`` that is
+    not ``enabled = false`` exists anywhere in the scan. For account-level
+    settings that change what a resource rule means (e.g.
+    ``aws_ebs_encryption_by_default`` encrypts every new volume), which
+    usually live in another module. The types present are recorded under
+    ``__repo_has__`` when the variable contexts are built."""
+    rtype = pat.get("unless_repo_has")
+    return bool(rtype) and rtype in var_defaults.get("__repo_has__", "").split()
+
+
 @_register_infile("resource_arg")
 def _detect_resource_arg(c: InFileCtx) -> list[dict]:
     """``resource_arg`` — match a regex (or its negation) against the
@@ -100,20 +154,33 @@ def _detect_resource_arg(c: InFileCtx) -> list[dict]:
 
     Supports ``regex`` (positive match), ``not_regex`` (negative match),
     ``fire_if_absent`` (fire when the arg is missing entirely), and the
-    ``suppress_if_body_contains`` and ``count = 0`` (resource definitely
-    not created) escape hatches. Variable references in the value are
+    ``suppress_if`` (see `_suppressed_by`), ``suppress_if_body_contains``
+    and ``count = 0`` (resource definitely not created) escape hatches,
+    ``name_regex`` / ``name_not_regex`` (see `_name_selected`) and
+    ``unless_repo_has`` (see `_repo_has`). Variable references in the value are
     resolved via the directory-scoped var_defaults.
+
+    The value is looked up at ``nested_path`` if set, else at ``arg``;
+    either may be dotted (``metadata_options.http_tokens``). Lookups are
+    top-level, like ``resource_missing_arg``. Through a repeated block
+    the rule fires if **any** instance's value matches, and
+    ``fire_if_absent`` fires if any instance lacks it
+    (tasks/hcl-parser-migration.md §4.4).
     """
     pat = c.pat
     has_regex = "regex" in pat
     has_not_regex = "not_regex" in pat
     fire_if_absent = pat.get("fire_if_absent", False)
-    if "resource" not in pat or "arg" not in pat:
+    # `nested_path` alone is enough (it is preferred over `arg` below);
+    # requiring `arg` made such patterns silently never fire.
+    if "resource" not in pat or not (pat.get("arg") or pat.get("nested_path")):
         return []
     if not has_regex and not has_not_regex:
         return []
+    if _repo_has(pat, c.var_defaults):
+        return []
     rt = pat["resource"]
-    arg = pat["arg"]
+    path = pat.get("nested_path") or pat["arg"]
     regex = re.compile(pat["regex"]) if has_regex else None
     not_regex = re.compile(pat["not_regex"]) if has_not_regex else None
     suppress_body_contains = pat.get("suppress_if_body_contains")
@@ -126,20 +193,106 @@ def _detect_resource_arg(c: InFileCtx) -> list[dict]:
             continue
         if suppress_body_contains and suppress_body_contains in blk["body"]:
             continue
-        val = block_arg_value(blk["body"], arg)
-        if val is None:
-            if fire_if_absent:
-                hit = True
-            else:
-                continue
+        if _suppressed_by(pat.get("suppress_if"), blk, c.var_defaults):
+            continue
+        if not _name_selected(pat, blk):
+            continue
+        values = resource_values_at(blk, path)
+        if fire_if_absent and (not values or not resource_has_path(blk, path)):
+            hit = True
+        elif not values:
+            continue
         else:
-            val = _resolve_var_ref(val, c.var_defaults)
             hit = False
-            if regex and regex.search(val):
-                hit = True
-            if not_regex and not not_regex.search(val):
-                hit = True
+            for val in values:
+                val = _resolve_var_ref(val, c.var_defaults)
+                if regex and regex.search(val):
+                    hit = True
+                if not_regex and not not_regex.search(val):
+                    hit = True
         if hit:
+            out.append({
+                "id": c.eid,
+                "file": str(c.file_path),
+                "line": blk["start_line"],
+                "resource": f"{btype}.{bname}",
+            })
+    return out
+
+
+def _has_companion(blk: dict, spec: dict, candidates: list[dict]) -> bool:
+    """Whether a resource of type ``spec["resource"]`` among `candidates`
+    points at `blk` through its ``spec["via"]`` argument (default
+    ``bucket``; a list means any of them): by reference
+    (``aws_s3_bucket.x.id``, ``.bucket``, ``[0].id`` …), by the same
+    value `blk` has for that argument (``bucket = "my-bucket"``, or the
+    same ``local.bucket_name`` / ``var.name`` expression, on both), or by
+    iterating it (``for_each = aws_s3_bucket.x`` with
+    ``bucket = each.value.id``)."""
+    ctype = spec.get("resource")
+    via = spec.get("via", "bucket")
+    vias = via if isinstance(via, list) else [via]
+    if not ctype:
+        return False
+    btype, bname = blk["groups"]
+    ref = re.compile(rf'(?<![\w.]){re.escape(btype)}\.{re.escape(bname)}(?![\w-])')
+    literals: dict[str, str] = {}
+    for arg in vias:
+        literal = block_arg_value(blk["body"], arg)
+        # Within one module the same expression is the same value, so
+        # `bucket = local.bucket_name` on both links them (it used to be
+        # skipped, a false positive). Not `each.` / `count.` / `self.`:
+        # those differ per instance.
+        if literal and not literal.startswith(("each.", "count.", "self.", "${each.", "${count.")):
+            literals[arg] = literal
+    for cand in candidates:
+        if cand["groups"][0] != ctype:
+            continue
+        # `for_each = aws_s3_bucket.many` + `bucket = each.value.id`: the
+        # companion iterates over this resource's instances.
+        for_each = block_arg_value(cand["body"], "for_each") or ""
+        iterates_blk = bool(ref.search(for_each))
+        for arg in vias:
+            value = block_arg_value(cand["body"], arg)
+            if value and (ref.search(value) or literals.get(arg) == value):
+                return True
+            if value and iterates_blk and re.match(r"\$?\{?\s*each\.", value):
+                return True
+    return False
+
+
+@_register_infile("ip_range_span")
+def _detect_ip_range_span(c: InFileCtx) -> list[dict]:
+    """``ip_range_span`` — fire when the IP range a resource allows, from
+    ``start_arg`` to ``end_arg``, covers at least ``min_addresses``
+    addresses. For firewall rules written as a start / end pair (Azure
+    SQL, PostgreSQL / MySQL flexible server, Synapse …): matching the two
+    ends against fixed values missed ``0.0.0.1``–``255.255.255.254``,
+    which is just as open. Ends that are not literal addresses (an
+    unresolved variable) are skipped.
+    """
+    pat = c.pat
+    rt, start_arg, end_arg = pat.get("resource"), pat.get("start_arg"), pat.get("end_arg")
+    min_addresses = int(pat.get("min_addresses") or 0)
+    if not (rt and start_arg and end_arg and min_addresses):
+        return []
+    out: list[dict] = []
+    for blk in c.resources:
+        btype, bname = blk["groups"]
+        if btype != rt or _resource_is_count_zero(blk["body"], c.var_defaults):
+            continue
+        ends = []
+        for arg in (start_arg, end_arg):
+            values = resource_values_at(blk, arg)
+            try:
+                ends.append(ipaddress.ip_address(
+                    _resolve_var_ref(values[0], c.var_defaults).strip()
+                ))
+            except (IndexError, ValueError):
+                break
+        if len(ends) != 2 or ends[0].version != ends[1].version:
+            continue
+        if int(ends[1]) - int(ends[0]) + 1 >= min_addresses:
             out.append({
                 "id": c.eid,
                 "file": str(c.file_path),
@@ -154,11 +307,26 @@ def _detect_resource_missing_arg(c: InFileCtx) -> list[dict]:
     """``resource_missing_arg`` — fire when the named argument (or
     dotted nested path) is absent from a resource body.
 
-    Honours ``suppress_if`` (don't fire when a sibling arg has a
-    specific value), ``suppress_if_body_contains``, the ``count = 0``
+    Presence is top-level: a same-named key inside a nested block or an
+    object attribute (e.g. a ``tags`` key) does not count — rules that
+    mean a nested setting use ``nested_path``. When a path segment is a
+    repeated block, every instance must have the rest of the path, unless
+    the pattern sets ``instances: any`` (tasks/hcl-parser-migration.md
+    §4.4). Uses the parse tree when the file parsed, else the regex
+    fallback with the same rules.
+
+    Honours ``suppress_if`` (don't fire when a sibling arg equals a value
+    or matches a regex; `_suppressed_by`), ``suppress_if_body_contains``, the ``count = 0``
     escape hatch, and the AWS ``default_tags`` propagation (R30.0.12 —
     when the dir's AWS provider declares default_tags, ``tags`` /
     ``tags.*`` paths on aws_* resources are silently provided).
+
+    ``name_regex`` limits the rule to resources whose label, ``name`` or
+    ``bucket`` matches; ``name_not_regex`` excludes them. ``unless_companion: {resource: T, via: A}`` skips
+    a resource that a ``T`` in the same module points at through its
+    ``A`` argument — the split-resource form of a setting, e.g. AWS
+    provider v4+'s ``aws_s3_bucket_versioning { bucket =
+    aws_s3_bucket.x.id }`` instead of an inline ``versioning`` block.
     """
     pat = c.pat
     if "resource" not in pat:
@@ -166,6 +334,8 @@ def _detect_resource_missing_arg(c: InFileCtx) -> list[dict]:
     rt = pat["resource"]
     arg_path = pat.get("nested_path") or pat.get("arg") or ""
     if not arg_path:
+        return []
+    if _repo_has(pat, c.var_defaults):
         return []
     if (
         rt.startswith("aws_")
@@ -175,6 +345,7 @@ def _detect_resource_missing_arg(c: InFileCtx) -> list[dict]:
         return []
     suppress_if = pat.get("suppress_if")
     suppress_body_contains = pat.get("suppress_if_body_contains")
+    companion = pat.get("unless_companion")
     out: list[dict] = []
     for blk in c.resources:
         btype, bname = blk["groups"]
@@ -184,20 +355,21 @@ def _detect_resource_missing_arg(c: InFileCtx) -> list[dict]:
             continue
         if suppress_body_contains and suppress_body_contains in blk["body"]:
             continue
-        if "." in arg_path:
-            present = block_has_nested_path(blk["body"], arg_path)
-        else:
-            present = block_has_arg(blk["body"], arg_path)
+        if not _name_selected(pat, blk):
+            continue
+        if companion and _has_companion(
+            blk, companion,
+            c.resources if c.module_resources is None else c.module_resources,
+        ):
+            continue
+        # Parse tree when the file parsed, else the regex fallback with
+        # the same top-level / every-instance rules (_hcl.resource_has_path).
+        present = resource_has_path(
+            blk, arg_path, every=pat.get("instances", "all") != "any",
+        )
         if not present:
-            if suppress_if:
-                s_arg = suppress_if.get("arg", "")
-                s_val = str(suppress_if.get("equals", "")).lower().strip("\"'")
-                if s_arg and s_val:
-                    actual = block_arg_value(blk["body"], s_arg)
-                    if actual:
-                        actual = _resolve_var_ref(actual, c.var_defaults)
-                    if actual and str(actual).lower().strip("\"'") == s_val:
-                        continue
+            if _suppressed_by(suppress_if, blk, c.var_defaults):
+                continue
             out.append({
                 "id": c.eid,
                 "file": str(c.file_path),
@@ -207,12 +379,61 @@ def _detect_resource_missing_arg(c: InFileCtx) -> list[dict]:
     return out
 
 
+@_register_infile("resource_missing_companion")
+def _detect_resource_missing_companion(c: InFileCtx) -> list[dict]:
+    """``resource_missing_companion`` — fire on each ``resource`` that no
+    ``companion`` in the same module points at through ``via`` (see
+    `_has_companion`): every S3 bucket needs *its own* public access
+    block, every VPC its own flow log.
+
+    The per-resource form of ``resource_absent``, which fires only when
+    the companion type is missing from the whole repository — so one
+    public access block anywhere passed every bucket. Keep
+    ``resource_absent`` for account-level singletons (GuardDuty, a
+    password policy).
+
+    ``exempt_if_companion: {resource, via}`` exempts a resource that such
+    a resource points at — e.g. a bucket that is some
+    ``aws_s3_bucket_logging``'s ``target_bucket`` is a log destination and
+    does not log its own access.
+    """
+    pat = c.pat
+    rt, ctype, via = pat.get("resource"), pat.get("companion"), pat.get("via")
+    if not (rt and ctype and via):
+        return []
+    spec = {"resource": ctype, "via": via}
+    exempt = pat.get("exempt_if_companion")
+    candidates = c.resources if c.module_resources is None else c.module_resources
+    out: list[dict] = []
+    for blk in c.resources:
+        btype, bname = blk["groups"]
+        if btype != rt:
+            continue
+        if _resource_is_count_zero(blk["body"], c.var_defaults):
+            continue
+        if _has_companion(blk, spec, candidates):
+            continue
+        if exempt and _has_companion(blk, exempt, candidates):
+            continue
+        out.append({
+            "id": c.eid,
+            "file": str(c.file_path),
+            "line": blk["start_line"],
+            "resource": f"{btype}.{bname}",
+        })
+    return out
+
+
 @_register_infile("resource_body_contains")
 def _detect_resource_body_contains(c: InFileCtx) -> list[dict]:
     """``resource_body_contains`` — fire on every resource of the named
     type whose body matches a regex. Unlike ``grep``, this scopes to a
     specific resource type and respects block boundaries — the regex
     doesn't need to limit itself to ``[^}]``.
+
+    Comments and heredoc bodies are blanked before matching, so
+    commented-out code and heredoc text (user-data scripts, inline policy
+    documents) can't match; ordinary quoted values still can.
     """
     pat = c.pat
     if "resource" not in pat or "regex" not in pat:
@@ -224,7 +445,7 @@ def _detect_resource_body_contains(c: InFileCtx) -> list[dict]:
         btype, bname = blk["groups"]
         if btype != rt:
             continue
-        if regex.search(blk["body"]):
+        if regex.search(mask_comments_and_heredocs(blk["body"])):
             out.append({
                 "id": c.eid,
                 "file": str(c.file_path),
@@ -241,9 +462,10 @@ def _detect_hcl_attr(c: InFileCtx) -> list[dict]:
 
     Used for rules like "the
     ``server_side_encryption_configuration.rule.apply_server_side_encryption_by_default.sse_algorithm``
-    must be ``aws:kms``". Honours ``suppress_if_body_contains``. Uses
-    the shared ``brace_walk`` (R30.13) to descend through nested
-    blocks.
+    must be ``aws:kms``". Honours ``suppress_if_body_contains``. The
+    path is walked top-level like ``nested_path`` (parse tree, or the
+    regex fallback with the same rules); through a repeated block the
+    rule fires if any instance's value differs.
     """
     pat = c.pat
     if "resource" not in pat or "path" not in pat:
@@ -259,28 +481,12 @@ def _detect_hcl_attr(c: InFileCtx) -> list[dict]:
             continue
         if suppress_body_contains and suppress_body_contains in blk["body"]:
             continue
-        parts = path.split(".")
-        parent_body = blk["body"]
-        for p in parts[:-1]:
-            m = re.search(rf'(?m)^\s*{re.escape(p)}\s*\{{', parent_body)
-            if not m:
-                parent_body = None
-                break
-            end_after = brace_walk(parent_body, m.end() - 1)
-            if end_after is None:
-                parent_body = None
-                break
-            end = end_after - 1
-            parent_body = parent_body[m.end():end]
-        if parent_body is None:
+        if not_equal is None:
             continue
-        val = block_arg_value(parent_body, parts[-1])
-        if val is None:
-            continue
-        val = _resolve_var_ref(val, c.var_defaults)
-        if not_equal is not None:
+        ne_norm = str(not_equal).strip().strip('"').strip("'").lower()
+        for val in resource_values_at(blk, path):
+            val = _resolve_var_ref(val, c.var_defaults)
             v_norm = str(val).strip().strip('"').strip("'").lower()
-            ne_norm = str(not_equal).strip().strip('"').strip("'").lower()
             if v_norm != ne_norm:
                 out.append({
                     "id": c.eid,
@@ -288,6 +494,7 @@ def _detect_hcl_attr(c: InFileCtx) -> list[dict]:
                     "line": blk["start_line"],
                     "resource": f"{btype}.{bname}",
                 })
+                break
     return out
 
 
@@ -362,9 +569,11 @@ def _detect_grep(c: InFileCtx) -> list[dict]:
       bodies, optionally filtered by resource type via ``resource``.
       Honours ``count = 0`` so resources definitely not created are
       skipped.
-    * default — search the full file (with comments stripped to
-      equal-length whitespace if ``hcl_context: true``). The match
-      offset is then attributed to a resource/data block by position.
+    * default — search the full file. ``code_only: true`` first blanks
+      comments and heredoc bodies (HCL-aware); ``hcl_context: true``
+      blanks comments only (older stripper, keeps heredoc text). Both
+      preserve offsets. The match offset is then attributed to a
+      resource/data block by position.
 
     The ``not_regex`` field (R30.6) suppresses the rule when the file
     matches a negative pattern — e.g. a workflow file that has both
@@ -386,7 +595,13 @@ def _detect_grep(c: InFileCtx) -> list[dict]:
     glob = pat.get("file_glob", "**/*.tf")
     if glob not in ("**/*.tf", "*.tf"):
         try:
-            matched = c.file_path.match(glob)
+            # A glob aimed at a `.tf` file also covers its `.tf.json` twin
+            # (`**/versions.tf` → `versions.tf.json`).
+            matched = c.file_path.match(glob) or (
+                glob.endswith(".tf")
+                and c.file_path.name.endswith(".tf.json")
+                and c.file_path.with_name(c.file_path.name[:-5]).match(glob)
+            )
         except ValueError as e:
             raise ValueError(
                 f"catalogue rule has malformed file_glob {glob!r}: {e}"
@@ -415,7 +630,18 @@ def _detect_grep(c: InFileCtx) -> list[dict]:
         return out
     # Full-file scope. `strip_hcl_context` preserves byte offsets so
     # `m.start()` is valid against `c.text` directly (R30.11 audit fix).
-    search_text = strip_hcl_context(c.text) if pat.get("hcl_context") else c.text
+    # `code_only: true` blanks comments and heredoc bodies with the
+    # HCL-aware lexer (escapes, `${}` nesting, heredocs) — for rules about
+    # Terraform structure, which never lives in a comment or heredoc.
+    # `hcl_context: true` is the older comment-only stripper; it keeps
+    # heredoc text (secret scanning relies on that) but is not
+    # heredoc-aware, so a crafted heredoc can confuse its string state.
+    if pat.get("code_only"):
+        search_text = mask_comments_and_heredocs(c.text)
+    elif pat.get("hcl_context"):
+        search_text = strip_hcl_context(c.text)
+    else:
+        search_text = c.text
     for m in regex.finditer(search_text):
         line = search_text.count("\n", 0, m.start()) + 1
         # Best-effort resource attribution by file position.
@@ -447,17 +673,21 @@ def _corpus_resource_absent(c: CorpusCtx) -> list[dict]:
     exists anywhere in the workspace. Used by rules that mandate a
     specific resource type be present (e.g. ``aws_cloudtrail.*``).
     ``when_present`` optionally gates the check on a prerequisite type.
+    A ``kubernetes_X`` type also matches ``kubernetes_X_v1`` and back
+    (`kubernetes_type_aliases`), for both the target and the prerequisite.
     """
     pat = c.pat
     if "resource" not in pat:
         return []
     rt = pat["resource"]
+    targets = kubernetes_type_aliases(rt)
     prerequisite = pat.get("when_present")
     if prerequisite:
+        prereqs = kubernetes_type_aliases(prerequisite)
         prereq_seen = False
         for _, text in c.all_files_text.items():
             for blk in find_blocks(text, RESOURCE_START):
-                if blk["groups"][0] == prerequisite:
+                if blk["groups"][0] in prereqs:
                     prereq_seen = True
                     break
             if prereq_seen:
@@ -467,7 +697,7 @@ def _corpus_resource_absent(c: CorpusCtx) -> list[dict]:
     seen = False
     for _, text in c.all_files_text.items():
         for blk in find_blocks(text, RESOURCE_START):
-            if blk["groups"][0] == rt:
+            if blk["groups"][0] in targets:
                 seen = True
                 break
         if seen:

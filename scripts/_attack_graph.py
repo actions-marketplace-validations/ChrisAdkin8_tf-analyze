@@ -231,7 +231,12 @@ def build_attack_graph(resource_index: dict, findings: list[dict]) -> dict:
         nodes[addr] = {
             "id": addr,
             "type": _NODE_TYPE_MAP.get(rtype, "compute"),
-            "label": addr,
+            # A name repeated across modules is keyed `<addr>@<dir>`; show
+            # the address and just the module folder.
+            "label": (
+                f"{res['addr']} ({addr.rsplit('/', 1)[-1]})"
+                if "@" in addr and "addr" in res else addr
+            ),
             "file": res["file"],
             "line": res["line"],
             "findings": finding_by_resource.get(addr, []),
@@ -470,7 +475,13 @@ def _apply_reachability_urgency(
     entry_map: dict[str, dict],
 ) -> None:
     """Promote findings on critical-path resources by one urgency tier;
-    demote findings on resources unreachable from INTERNET by one tier."""
+    demote findings on resources unreachable from INTERNET by one tier.
+
+    The tier moves from the finding's current urgency, not the
+    catalogue default, so a structured escalation (e.g. SSH open to the
+    world -> CRITICAL) is kept. An escalated finding is never demoted:
+    the escalation is direct evidence, the graph's reachability is an
+    inference, and demoting it would let ``--fail-on`` pass."""
     critical_path_set = set(graph.get("critical_path", []))
     internet_reachable_set = {
         n["id"] for n in graph.get("nodes", []) if n.get("internet_reachable")
@@ -478,12 +489,17 @@ def _apply_reachability_urgency(
     for f in findings:
         resource = f.get("resource", "")
         entry = entry_map.get(f["id"], {})
-        base = entry.get("default_urgency", "MEDIUM")
+        default = entry.get("default_urgency", "MEDIUM")
+        base = f.get("urgency") or default
         idx = _URGENCY_TIERS.index(base) if base in _URGENCY_TIERS else 1
+        escalated = (
+            default in _URGENCY_TIERS and base in _URGENCY_TIERS
+            and idx > _URGENCY_TIERS.index(default)
+        )
         if resource and resource in critical_path_set:
             f["urgency"] = _URGENCY_TIERS[min(idx + 1, len(_URGENCY_TIERS) - 1)]
             f["on_critical_path"] = True
-        elif resource and resource not in internet_reachable_set:
+        elif resource and resource not in internet_reachable_set and not escalated:
             f["urgency"] = _URGENCY_TIERS[max(idx - 1, 0)]
         else:
             f["urgency"] = base
@@ -516,6 +532,17 @@ def _mermaid_id(addr: str) -> str:
     return f"{sanitized}_{digest}"
 
 
+def _mermaid_label(text: str) -> str:
+    """A node / edge label safe inside a quoted Mermaid label: labels come
+    from resource names in the scanned repo, and Mermaid renders HTML in
+    labels, so `"`, `<`, `>` become `'`, `#lt;`, `#gt;` and newlines are
+    folded (a newline could also end the ```mermaid fence early)."""
+    return (
+        str(text).replace('"', "'").replace("<", "#lt;").replace(">", "#gt;")
+        .replace("\r", " ").replace("\n", " ")
+    )
+
+
 def graph_to_mermaid(graph: dict) -> str:
     """Convert an attack graph to a Mermaid flowchart string."""
     crit_set = set(graph.get("critical_path", []))
@@ -535,7 +562,7 @@ def graph_to_mermaid(graph: dict) -> str:
 
     for node in graph["nodes"]:
         nid = _mermaid_id(node["id"])
-        lbl = node["label"].replace('"', "'")
+        lbl = _mermaid_label(node["label"])
         if node["is_crown_jewel"]:
             lbl = f"\U0001f451 {lbl}"
         if node["type"] == "internet":
@@ -559,7 +586,7 @@ def graph_to_mermaid(graph: dict) -> str:
     for edge in graph["edges"]:
         fid = _mermaid_id(edge["from"])
         tid = _mermaid_id(edge["to"])
-        lbl = edge.get("label", "")
+        lbl = _mermaid_label(edge.get("label", ""))
         f_crit = edge["from"] in crit_set
         t_crit = edge["to"] in crit_set
         arrow = "==>" if (f_crit and t_crit) else "-->"
@@ -575,7 +602,15 @@ def graph_to_mermaid(graph: dict) -> str:
 def _render_graph_html(graph: dict) -> str:
     """Return self-contained HTML+JS for an interactive force-directed attack graph."""
     import json as _json
-    graph_json = _json.dumps(graph)
+    # Embedded in a <script> block: node names come from scanned file
+    # paths and resource names, so `</script>` (or `<!--`) in one must not
+    # end the block. Escaping `<`, `>`, `&` and the JS line separators
+    # keeps the JSON identical once parsed.
+    graph_json = (
+        _json.dumps(graph)
+        .replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+        .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+    )
 
     return f"""<div style="margin-bottom:.5em">
   <span style="font-size:12px;color:#666">

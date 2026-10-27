@@ -13,15 +13,14 @@
 [![VS Code Marketplace](https://img.shields.io/visual-studio-marketplace/v/tfanalyze.tf-analyze?label=vs%20code%20marketplace&logo=visualstudiocode)](https://marketplace.visualstudio.com/items?itemName=tfanalyze.tf-analyze)
 [![Docker](https://img.shields.io/badge/docker-ghcr.io-blue?logo=docker)](https://github.com/ChrisAdkin8/tf-analyze/pkgs/container/tf-analyze)
 [![tf-analyze score](https://tfanalyze.com/badge/ChrisAdkin8/tf-analyze.svg)](https://tfanalyze.com/scan/ChrisAdkin8/tf-analyze)
-![License: MPL-2.0](https://img.shields.io/badge/license-MPL--2.0-blue)
+![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)
 
 <!-- Content row — what does it cover? -->
 ![Python ≥3.10](https://img.shields.io/badge/python-%E2%89%A53.10-blue)
 ![Rules: 353](https://img.shields.io/badge/rules-353-brightgreen)
 ![fix_hcl: 93%](https://img.shields.io/badge/fix__hcl-93%25-brightgreen)
-![MITRE / CWE / D3FEND](https://img.shields.io/badge/MITRE%20%2F%20CWE%20%2F%20D3FEND-69%25%20%2F%2053%25%20%2F%2040%25-brightgreen)
+![MITRE / CWE / D3FEND](https://img.shields.io/badge/MITRE%20%2F%20CWE%20%2F%20D3FEND-80%25%20%2F%2068%25%20%2F%2047%25-brightgreen)
 ![CISA KEV: integrated](https://img.shields.io/badge/CISA%20KEV-integrated-orange)
-![Tests: 1153](https://img.shields.io/badge/tests-1153%20passing-brightgreen)
 [![Rule docs](https://img.shields.io/badge/rule%20docs-353%20pages-brightgreen?logo=github)](https://chrisadkin8.github.io/tf-analyze/rules/)
 
 **[Quickstart](#quickstart) · [Why tf-analyze?](#why-tf-analyze) · [Features](#features) · [Integrations](#integrations) · [Screenshots](#screenshots) · [Documentation](#documentation) · [Adding a rule](#adding-a-rule) · [Demo corpora](#demo-corpora--examples) · [Repo layout](#repository-layout) · [Contributing](#contributing--maintenance) · [Provenance](#provenance) · [License](#license)**
@@ -33,11 +32,11 @@ Same engine, ten surfaces — Claude Code skill, Python CLI, GitHub Action, Dock
 | Cloud | Security | Hardening | Ops & Reuse | **Total** |
 |---|---:|---:|---:|---:|
 | AWS | 62 | 25 | 4 | **91** |
-| GCP | 41 | 47 | 3 | **91** |
+| GCP | 41 | 46 | 3 | **90** |
 | Azure | 56 | 32 | 3 | **91** |
 | K8s / Helm | 12 | 6 | 0 | **18** |
-| Cross-cloud / engine | 21 | 27 | 14 | **62** |
-| **Total** | **192** | **137** | **24** | **353** |
+| Cross-cloud / engine | 22 | 27 | 14 | **63** |
+| **Total** | **193** | **136** | **24** | **353** |
 
 Hardening = `ROB-*` + `STK-*`; Ops & Reuse = `OPS-*` + `COST-*` + `MOD-*` + `MOD-REUSE-*` + `INT-*` + `CI-*` + `STYLE-*`. Full per-family breakdown and shape-by-cloud commentary in [Detection ↓](#detection).
 
@@ -59,8 +58,7 @@ open report.html
 ```sh
 git clone https://github.com/ChrisAdkin8/tf-analyze.git
 cd tf-analyze
-./install.sh                                          # installs as a Claude Code skill
-pip install python-hcl2                               # optional fast-path (default-on if present)
+./install.sh                                          # installs as a Claude Code skill (no pip install needed)
 
 python3 scripts/detect.py --target /path/to/terraform
 python3 scripts/detect.py --target . --mode diff --fail-on HIGH --format sarif > out.sarif
@@ -85,7 +83,7 @@ Live diagnostics, Quick Fix, attack graph, Module Reuse Advisor, and a `vscode:/
 code --install-extension tfanalyze.tf-analyze
 
 # Or from a downloaded .vsix (current path until the Marketplace listing publishes)
-code --install-extension tf-analyze-0.1.57.vsix
+code --install-extension tf-analyze-0.1.58.vsix
 ```
 
 Open any Terraform workspace and the six status-bar shortcuts appear bottom-left:
@@ -108,7 +106,7 @@ To see the deeper panels render against rich input, open one of the showcase cor
     ref: v0.2.6                          # optional — shorthand for image tag (default: :latest)
 ```
 
-`ref:` is a convenience alias — `ref: v0.2.6` is equivalent to `image: ghcr.io/chrisadkin8/tf-analyze:0.2.6` (the leading `v` is stripped before building the docker tag, since `docker/metadata-action` publishes semver tags without it). Both `v0.2.6` and `0.2.6` work; non-semver values like `main` or `latest` pass through untouched. Set `ref:` or `image:`, not both. See [`action.yml`](action.yml) for the full input reference, and [`integrations/github-action.yml`](integrations/github-action.yml) for an alternative install-from-source workflow that adds SARIF upload + HTML artefact.
+By default the engine image follows the ref you call the action at — `uses: ChrisAdkin8/tf-analyze@v0.2.6` runs `ghcr.io/chrisadkin8/tf-analyze:0.2.6`, and a commit-SHA pin runs that commit's image; a branch ref falls back to `:latest` with a warning. `ref:` is a convenience alias — `ref: v0.2.6` is equivalent to `image: ghcr.io/chrisadkin8/tf-analyze:0.2.6` (the leading `v` is stripped before building the docker tag, since `docker/metadata-action` publishes semver tags without it). Both `v0.2.6` and `0.2.6` work; non-semver values like `main` or `latest` pass through untouched. Set `ref:` or `image:`, not both. See [`action.yml`](action.yml) for the full input reference, and [`integrations/github-action.yml`](integrations/github-action.yml) for an alternative install-from-source workflow that adds SARIF upload + HTML artefact.
 
 ---
 
@@ -155,7 +153,7 @@ A scanner is only as good as the actions it provokes. Where comparable tools sto
 | Native Terraform provider (`data "tfanalyze_scan"`) | ✅ | ❌ | ❌ | ❌ |
 | MCP server for AI agents (Cursor / Claude Desktop / …) | ✅ | ❌ | ❌ | ❌ |
 | YAML custom rules | ✅ pattern **+ policy DSL** (cross-resource / conditional / aggregate) | ✅ (Rego) | ✅ (Python+YAML) | ✅ (Python) |
-| Stdlib-only core (optional fast-path) | ✅ | n/a | ❌ (pip) | ❌ (pip) |
+| No `pip install` needed (HCL parser vendored) | ✅ | n/a | ❌ (pip) | ❌ (pip) |
 
 > Comparison reflects features documented as of 2026-05; corrections welcome via issue.
 
@@ -189,17 +187,17 @@ A scanner is only as good as the actions it provokes. Where comparable tools sto
 | Cross-resource | `INT-*`, `graph_check` | Intent–implementation gaps, KMS location parity, IAM breadth |
 | Module reuse (advisory) | `MOD-REUSE-*` | Hand-rolled scaffolding that mirrors a popular Terraform Registry module — INFO tier, never gates CI. Pass `--show-info` to render |
 
-**Per-cloud breakdown** (numerical parity across AWS, GCP, Azure as of 2026-05-13):
+**Per-cloud breakdown** (as of 2026-10-27):
 
 | Cloud  | SEC | ROB | STK | OPS | COST | MOD-REUSE | **Total** |
 |--------|----:|----:|----:|----:|-----:|----------:|----------:|
 | AWS    | 62  | 13  | 12  | 2   | 1    | 1         | **91**    |
-| GCP    | 41  | 5   | 42  | 1   | 1    | 1         | **91**    |
+| GCP    | 41  | 5   | 41  | 1   | 1    | 1         | **90**    |
 | Azure  | 56  | 7   | 25  | 1   | 1    | 1         | **91**    |
 | K8s/Helm | 12 | —  | 6   | —   | —    | —         | **18**    |
-| Cross-cloud / engine | — | — | — | — | — | — | **62** |
+| Cross-cloud / engine | — | — | — | — | — | — | **63** |
 
-**Why the per-section shapes differ at the same headline count.** Each cloud puts services in different boxes, and the catalogue follows the provider taxonomy rather than forcing a synthetic split:
+**Why the per-section shapes differ.** Each cloud puts services in different boxes, and the catalogue follows the provider taxonomy rather than forcing a synthetic split:
 
 - **AWS skews `SEC` (62)** because more discrete services have their own dedicated security rule — KMS, ECR, CloudTrail, GuardDuty, Security Hub, MSK, Neptune, DocDB, Athena, Cognito, Kinesis, SNS, SQS, Secrets Manager, SSM. Each surfaces a distinct misconfiguration class that maps 1:1 to a rule.
 - **GCP skews `STK` (42)** because GCP rolls multi-feature platforms (GKE, Cloud Run, Cloud SQL, BigQuery, Composer, Dataproc) where hardening is expressed as *stack-level configuration* (release channels, workload identity, binary authorization, IAM auth flags, CMEK on the platform) rather than per-service `SEC-*` rules.
@@ -207,7 +205,7 @@ A scanner is only as good as the actions it provokes. Where comparable tools sto
 - **`ROB` is small everywhere** (13 / 5 / 7) because lifecycle and backup gaps map onto a small set of stateful resource shapes per cloud (RDS / Cloud SQL / Azure SQL + Cosmos + VMSS).
 - **`OPS` / `COST` / `MOD-REUSE` are deliberately 1-2 each per cloud** — these tier-INFO/MEDIUM rules are about workflow ergonomics, not service depth, so one well-curated rule per cloud beats many redundant ones.
 
-The headline number is parity. The shape is a property of each provider's product surface.
+The per-cloud totals are close but not a target; a rule exists because it catches a real problem. The shape is a property of each provider's product surface.
 
 ### Execution modes
 
@@ -242,16 +240,19 @@ Every text, JSON, and HTML scan emits a deterministic 0–100 health score and l
 
 ```json
 "summary": {
-  "scoring_version": 1,
+  "scoring_version": 2,
   "score": 82,
   "grade": "B",
   "counts": {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 4, "LOW": 6, "INFO": 0},
   "suppressed_count": 0,
-  "formula": "max(0, floor(100 - sum(weight * count))); weights: CRITICAL=15, HIGH=7, MEDIUM=3, LOW=1, INFO=0; suppressed at half weight"
+  "resources_scanned": 12,
+  "size_factor": 1.0,
+  "penalty": 18.0,
+  "formula": "max(0, floor(100 - (15*CRITICAL + 7*HIGH + (3*MEDIUM + 1*LOW) / size_factor))); size_factor = max(1, sqrt(resources_scanned / 20)), counting resources of a type a rule checks; INFO=0; suppressed at half weight"
 }
 ```
 
-Suppressed and baseline-suppressed findings count at half weight (acknowledged, but the underlying risk still exists). INFO findings carry weight 0. The `scoring_version` field pins the formula — weight changes bump it so downstream gates can detect breakage. CI gates use `--fail-on LEVEL` (the urgency tier) rather than gating on the grade, intentionally — the grade is for trend visibility, not pass/fail.
+CRITICAL and HIGH findings cost the same in any repository — each is a concrete exposure. MEDIUM and LOW are hygiene and are judged relative to size: up to 20 resources the size factor is 1, at 80 resources it halves their penalty, at 2,000 it divides it by ten, so a large estate isn't graded F just for being large. Only resources of a type some rule checks count towards the size (`resources_scanned`), so padding a repo with `terraform_data` or `null_resource` blocks does not lift the score. Suppressed and baseline-suppressed findings count at half weight (acknowledged, but the underlying risk still exists). INFO findings carry weight 0. The `scoring_version` field pins the formula — weight changes bump it so downstream gates can detect breakage. CI gates use `--fail-on LEVEL` (the urgency tier) rather than gating on the grade, intentionally — the grade is for trend visibility, not pass/fail.
 
 ### Useful modifiers
 
@@ -265,10 +266,9 @@ Suppressed and baseline-suppressed findings count at half weight (acknowledged, 
 | `--apply-fixes dry-run\|apply` | Preview / write `fix_hcl` patches to source files |
 | `--cache` | Incremental scan cache keyed on file + catalogue hash |
 | `--diff-base REF` | Limit to `.tf` files changed since `REF` |
-| `--no-hcl2` | Disable the python-hcl2 fast-path (env: `TF_ANALYZE_NO_HCL2=1`) |
 | `--show-info` | Render INFO-tier findings (e.g. `MOD-REUSE-*` module-reuse advisories). Default off — INFO is counted in `summary.counts.INFO` but not displayed |
 | `--rank-by exploitability\|hybrid` | Promote findings whose rule touches a CISA KEV-listed CWE one urgency tier; surface 🔥 KEV badge in text/PR-summary/SARIF. Daily-cached at `~/.cache/tf-analyze/`. Pair with `--no-threat-intel` for air-gapped CI. |
-| `--explain-score` | Top-5 findings ranked by score impact, with projected score/grade if each is fixed. Tells you which fix is worth most. Surfaces as a header block in text output and a structured `score_explanation` field in JSON. |
+| `--explain-score` | Top-5 findings ranked by score impact, with the points each fix is worth (MEDIUM / LOW after the size factor) and the projected score/grade if each is fixed. Tells you which fix is worth most. Surfaces as a header block in text output and a structured `score_explanation` field in JSON. |
 | `--mode drift --state-json PATH` | Diff the static-HCL findings against `terraform show -json state.tfstate` output. Findings tagged `mode='state'` so oncalls can spot the gap between the HCL the team wrote and what's actually deployed. |
 | `--pdf-output PATH` | Render the compliance gap report to a CISO-targetable PDF via weasyprint (optional dep). Pair with `--compliance --compliance-framework <name>`. |
 | `--apply-fixes × --baseline` | When both are set, `--apply-fixes` skips findings already in baseline. Closes the "snapshot today, fix only new stuff" UX. |
@@ -282,10 +282,10 @@ Full CLI reference: [`docs/cli.md`](docs/cli.md).
 |---|------|-----|
 | GitHub Action (marketplace) | [`action.yml`](action.yml) | Published composite action — `uses: ChrisAdkin8/tf-analyze@v1`. SARIF upload, inline PR `suggestion` blocks, engine-rendered PR summary (`--format pr-summary`), optional `compliance-framework` / `attack-graph` inputs, pin via `ref:` or `image:` for reproducible CI. |
 | GitHub Action (workflow template) | [`integrations/github-action.yml`](integrations/github-action.yml) | Alternative reference workflow that installs the engine from source instead of pulling the Docker image. Adds `show-info` input. Copy into your own `.github/workflows/`. |
-| VS Code extension (v0.1.57) | [`vscode-extension/`](vscode-extension/) | Self-contained `.vsix` (engine + catalogue bundled). LSP-driven diagnostics, Quick Fix, status-bar score+grade badge, attack-graph + 🌊 blast-radius + module-reuse panels, bulk apply-fixes with diff preview, baseline suppression UI, `vscode://` URI handler. Full feature list: [`docs/vscode-extension.md`](docs/vscode-extension.md). |
+| VS Code extension (v0.1.58) | [`vscode-extension/`](vscode-extension/) | Self-contained `.vsix` (engine + catalogue bundled). LSP-driven diagnostics, Quick Fix, status-bar score+grade badge, attack-graph + 🌊 blast-radius + module-reuse panels, bulk apply-fixes with diff preview, baseline suppression UI, `vscode://` URI handler. Full feature list: [`docs/vscode-extension.md`](docs/vscode-extension.md). |
 | Score badge service | [`integrations/badge-service/`](integrations/badge-service/) | FastAPI app — embeddable SVG score badges per repo (`https://<host>/score/<owner>/<repo>.svg`); HMAC-signed `/ingest` endpoint accepts `detect.py --format json` output. Engineering complete; awaits `flyctl deploy`. |
 | LSP server (`--lsp`) | `scripts/detect.py --lsp` | [`docs/lsp.md`](docs/lsp.md) |
-| Docker image | `ghcr.io/chrisadkin8/tf-analyze` | Multi-arch `linux/amd64` + `linux/arm64`; bundles `python-hcl2` |
+| Docker image | `ghcr.io/chrisadkin8/tf-analyze` | Multi-arch `linux/amd64` + `linux/arm64` |
 | Web demo | [`demo/`](demo/) | FastAPI + CodeMirror 6 + d3 attack graph |
 | Pre-commit hook | [`.pre-commit-hooks.yaml`](.pre-commit-hooks.yaml) | [`docs/pre-commit.md`](docs/pre-commit.md) |
 | HCP Terraform Run Task | [`integrations/run-task/`](integrations/run-task/) | [`docs/run-task.md`](docs/run-task.md) |
@@ -327,7 +327,7 @@ Additional screenshots: [compliance report](docs/images/compliance-report.png) �
 | Catalogue rule schema | [`catalog/README.md`](catalog/README.md) |
 | Sample reports against terragoat | [`reports/README.md`](reports/README.md) |
 | Skill prose (LLM-facing instructions) | [`SKILL.md`](SKILL.md) |
-| Roadmap and TODO | [`TODO.md`](TODO.md) |
+| Roadmap and backlog | [`tasks/TODO.md`](tasks/TODO.md) |
 | Changelog | [`CHANGELOG.md`](CHANGELOG.md) |
 | Blog (design notes, debugging tours, retros) | [`docs/blog/`](docs/blog/) |
 
@@ -380,17 +380,16 @@ The single-rule fixtures under [`fixtures/`](fixtures/) (239 positive + 146 clea
 ├── SKILL.md                    # Skill prose loaded as /tf-analyze in Claude Code
 ├── README.md                   # This file
 ├── CHANGELOG.md                # Per-round release notes
-├── TODO.md                     # Roadmap and backlog
 ├── CONTRIBUTING.md
-├── LICENSE                     # MPL-2.0
+├── LICENSE                     # Apache-2.0
 ├── Dockerfile                  # ghcr.io/chrisadkin8/tf-analyze
 ├── pyproject.toml
 ├── install.sh                  # Symlinks repo into ~/.claude/skills/tf-analyze
 ├── .pre-commit-hooks.yaml      # pre-commit.com hook declaration
 ├── .github/workflows/          # CI (ci.yml, docker.yml)
-├── catalog/                    # 343 rule definitions (one YAML per rule)
+├── catalog/                    # 354 rule definitions (one YAML per rule)
 │   └── README.md               # Schema reference
-├── fixtures/                   # 239 positive + 146 clean (negative) fixtures
+├── fixtures/                   # 360 positive + 264 clean (negative) fixtures
 ├── examples/                   # Showcase corpora
 │   ├── terragoat/              #   • Multi-cloud deliberately-vulnerable corpus
 │   ├── module-reuse-demo/      #   • Module Reuse Advisor showcase (3 clouds)
@@ -455,4 +454,4 @@ Built and exercised inside an HCP Vault + Consul + GKE platform engineering proj
 
 ## License
 
-[Mozilla Public License 2.0](LICENSE). Catalogue rules and fixtures are released under the same licence to permit upstream contributions and downstream forks.
+[Apache License 2.0](LICENSE). Catalogue rules and fixtures are released under the same licence to permit upstream contributions and downstream forks.

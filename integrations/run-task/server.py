@@ -38,7 +38,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 try:
-    from fastapi import FastAPI, Request, HTTPException
+    from fastapi import BackgroundTasks, FastAPI, Request, HTTPException
     from fastapi.responses import JSONResponse
     import requests  # type: ignore
 except ImportError:  # pragma: no cover
@@ -52,7 +52,13 @@ except ImportError:  # pragma: no cover
 LOG = logging.getLogger("tf-analyze.runtask")
 logging.basicConfig(level=os.environ.get("TFA_LOG_LEVEL", "INFO"))
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+# TFA_REPO_ROOT lets the container point at its bundled engine
+# (/tf-analyze); the default is the source-checkout layout. `.parent` chains
+# rather than `.parents[2]`, which raises IndexError for /app/server.py.
+REPO_ROOT = Path(os.environ.get(
+    "TFA_REPO_ROOT",
+    str(Path(__file__).resolve().parent.parent.parent),
+))
 DETECT_PY = REPO_ROOT / "scripts" / "detect.py"
 HMAC_KEY = os.environ.get("TFA_RUN_TASK_HMAC_KEY", "").encode()
 FAIL_ON = os.environ.get("TFA_RUN_TASK_FAIL_ON", "HIGH")
@@ -95,7 +101,11 @@ URGENCY_RANK = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
 
 
 def _verify_hmac(body: bytes, header: str | None) -> bool:
-    """HCP Terraform sends X-Tfc-Task-Signature: sha512=hex(hmac).
+    """HCP Terraform sends `X-Tfc-Task-Signature`: the HMAC-SHA512 of the
+    body under the run task's key, as hex. The docs show no prefix, and
+    requiring `sha512=` (as this used to) would reject every real request,
+    so a bare digest is accepted and a `sha512=` prefix tolerated; either
+    way the full digest is compared in constant time.
 
     Fails CLOSED: with TFA_RUN_TASK_HMAC_KEY unset we reject every request,
     because an unauthenticated endpoint here is a remotely-driven SSRF +
@@ -111,10 +121,32 @@ def _verify_hmac(body: bytes, header: str | None) -> bool:
             "or TFA_RUN_TASK_ALLOW_INSECURE=1 for local dev."
         )
         return False
-    if not header or not header.startswith("sha512="):
+    if not header:
         return False
+    supplied = header.strip().removeprefix("sha512=").lower()
     expected = hmac.new(HMAC_KEY, body, sha512).hexdigest()
-    return hmac.compare_digest(expected, header[7:])
+    return hmac.compare_digest(expected, supplied)
+
+
+# A run-task request is a small JSON document; read no more than this
+# before the signature check (an unauthenticated caller could otherwise
+# make the server buffer an arbitrarily large body).
+MAX_REQUEST_BYTES = 1024 * 1024
+
+
+async def _read_capped_body(request: Request) -> bytes:
+    """The request body, or 413 once it exceeds `MAX_REQUEST_BYTES`."""
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > MAX_REQUEST_BYTES:
+        raise HTTPException(status_code=413, detail="request body too large")
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > MAX_REQUEST_BYTES:
+            raise HTTPException(status_code=413, detail="request body too large")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _addr_is_public(ip: str) -> bool:
@@ -168,7 +200,6 @@ def _run_detect(plan_json_path: Path) -> tuple[dict, int]:
         "--plan-json", str(plan_json_path),
         "--format", "json",
         "--fail-on", FAIL_ON,
-        "--no-hcl2",  # plan path doesn't need heredoc parser
     ]
     if COMPLIANCE_FRAMEWORK:
         cmd.extend(["--compliance-framework", COMPLIANCE_FRAMEWORK])
@@ -325,8 +356,17 @@ def _format_status_body(data: dict, threshold: str) -> dict:
 
 
 @app.post("/runtask")
-async def run_task(request: Request) -> JSONResponse:
-    body = await request.body()
+async def run_task(request: Request, background: BackgroundTasks) -> JSONResponse:
+    """Verify the request, reply 200 at once, and do the work afterwards.
+
+    HCP Terraform expects a prompt 200 and the result later on the
+    callback URL (it waits up to 10 minutes). Downloading the plan,
+    scanning it (up to 120 s) and calling back used to happen before the
+    reply, and with blocking `requests` calls inside this async handler,
+    so one run stalled every other request. The work now runs as a
+    background task, in a worker thread.
+    """
+    body = await _read_capped_body(request)
     signature = request.headers.get("x-tfc-task-signature")
     if not _verify_hmac(body, signature):
         raise HTTPException(status_code=401, detail="invalid HMAC signature")
@@ -353,44 +393,67 @@ async def run_task(request: Request) -> JSONResponse:
     _validate_outbound_url(plan_url, "plan_json_api_url")
     _validate_outbound_url(callback_url, "task_result_callback_url")
 
-    headers = {"Authorization": f"Bearer {access_token}"} if access_token else {}
-    # allow_redirects=False — a 30x from an allow-listed host could otherwise
-    # bounce us to an internal address with the token attached.
-    plan_resp = requests.get(
-        plan_url, headers=headers, timeout=30, allow_redirects=False, stream=True,
-    )
-    if plan_resp.status_code != 200:
-        LOG.error("plan download failed: %s", plan_resp.status_code)
-        raise HTTPException(status_code=502, detail="cannot fetch plan-json")
+    background.add_task(_process_run_task, plan_url, callback_url, access_token)
+    return JSONResponse({"accepted": True})
 
-    # Cap the body — bound memory against an oversized response or a gzip
-    # bomb (requests auto-decompresses Content-Encoding: gzip).
-    plan_chunks: list[bytes] = []
-    total = 0
-    for chunk in plan_resp.iter_content(64 * 1024):
-        total += len(chunk)
-        if total > MAX_PLAN_BYTES:
-            plan_resp.close()
-            raise HTTPException(status_code=413, detail="plan-json exceeds size cap")
-        plan_chunks.append(chunk)
 
-    with tempfile.TemporaryDirectory() as td:
-        plan_path = Path(td) / "plan.json"
-        plan_path.write_bytes(b"".join(plan_chunks))
-        data, _ = _run_detect(plan_path)
-
-    findings = data.get("findings") or []
-    callback_body = _format_status_body(data, FAIL_ON)
+def _callback(callback_url: str, headers: dict, body: dict) -> None:
     cb = requests.patch(
         callback_url,
         headers={**headers, "Content-Type": "application/vnd.api+json"},
-        data=json.dumps(callback_body),
+        data=json.dumps(body),
         timeout=10,
         allow_redirects=False,
     )
     if cb.status_code >= 300:
         LOG.warning("callback returned %s: %s", cb.status_code, cb.text[:200])
-    return JSONResponse({"received": len(findings)})
+
+
+def _failed_result(message: str) -> dict:
+    return {"data": {"type": "task-results",
+                     "attributes": {"status": "failed", "message": message}}}
+
+
+def _process_run_task(plan_url: str, callback_url: str, access_token: str) -> None:
+    """Download the plan, scan it and report to `callback_url` (a sync
+    function, so FastAPI runs it in its thread pool). Any failure is
+    reported as a `failed` result rather than leaving HCP waiting."""
+    headers = {"Authorization": f"Bearer {access_token}"} if access_token else {}
+    try:
+        # allow_redirects=False — a 30x from an allow-listed host could
+        # otherwise bounce us to an internal address with the token attached.
+        plan_resp = requests.get(
+            plan_url, headers=headers, timeout=30, allow_redirects=False, stream=True,
+        )
+        if plan_resp.status_code != 200:
+            LOG.error("plan download failed: %s", plan_resp.status_code)
+            _callback(callback_url, headers,
+                      _failed_result(f"tf-analyze: cannot fetch plan-json ({plan_resp.status_code})"))
+            return
+        # Cap the body — bound memory against an oversized response or a
+        # gzip bomb (requests auto-decompresses Content-Encoding: gzip).
+        plan_chunks: list[bytes] = []
+        total = 0
+        for chunk in plan_resp.iter_content(64 * 1024):
+            total += len(chunk)
+            if total > MAX_PLAN_BYTES:
+                plan_resp.close()
+                _callback(callback_url, headers,
+                          _failed_result("tf-analyze: plan-json exceeds the size cap"))
+                return
+            plan_chunks.append(chunk)
+
+        with tempfile.TemporaryDirectory() as td:
+            plan_path = Path(td) / "plan.json"
+            plan_path.write_bytes(b"".join(plan_chunks))
+            data, _ = _run_detect(plan_path)
+        _callback(callback_url, headers, _format_status_body(data, FAIL_ON))
+    except Exception:  # noqa: BLE001 — report, never leave the run hanging
+        LOG.exception("run task failed")
+        try:
+            _callback(callback_url, headers, _failed_result("tf-analyze: internal error"))
+        except Exception:  # noqa: BLE001
+            LOG.exception("failure callback failed")
 
 
 @app.get("/healthz")

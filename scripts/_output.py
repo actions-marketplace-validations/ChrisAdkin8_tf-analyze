@@ -65,7 +65,7 @@ SARIF:
   * ``_sarif_fingerprint(finding)``
   * ``_sarif_taxonomies(entries)``
   * ``_sarif_rule_relationships(entry)``
-  * ``to_sarif(findings, entries)``
+  * ``to_sarif(findings, entries, parse_fallback_files=None)``
 
 Per-finding helpers:
   * ``_effective_urgency(finding, entry)``
@@ -105,6 +105,8 @@ import json
 import re
 import sys
 from pathlib import Path
+
+from _meta import __version__
 
 # ---- cross-seam imports -------------------------------------------------
 
@@ -186,6 +188,22 @@ def _md_cell(s: str) -> str:
     return str(s).replace("|", "\\|").replace("\n", " ").replace("\r", " ")
 
 
+def _md_code(s: object) -> str:
+    """`s` as a Markdown inline-code span that is also safe in a table
+    cell. File paths and resource names come from the scanned repository,
+    so a value may itself contain backticks: wrapped in a single pair, a
+    path like ``a` | ![x](https://…) @someone `.tf`` closed the span and
+    injected an image and a mention into the PR comment. The fence is one
+    backtick longer than any run inside the value (CommonMark), padded
+    when the value starts or ends with one; ``|`` is escaped (GitHub
+    honours ``\\|`` inside code in tables) and newlines are folded."""
+    text = str(s).replace("\r", " ").replace("\n", " ").replace("|", "\\|")
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * (longest + 1)
+    pad = " " if text.startswith("`") or text.endswith("`") else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
+
+
 # ---- rule-docs canonical URL --------------------------------------------
 # Single source of truth for the per-rule docs URL — drives:
 #   - SARIF `helpUri` on every result + every rule definition
@@ -207,24 +225,79 @@ RULE_DOCS_URL_BASE = "https://chrisadkin8.github.io/tf-analyze/rules/{id}/"
 SARIF_HELP_URI_BASE = RULE_DOCS_URL_BASE
 
 
-def _sarif_fingerprint(finding: dict) -> dict:
+def _sarif_fingerprint(
+    finding: dict, uri: str | None = None, ordinal: int = 0,
+    resource_ordinal: int = 0,
+) -> dict:
     """Return partial fingerprints for SARIF.
 
     Two complementary keys:
     - tfAnalyze/v1: id|file|resource — changes when file is renamed (new/resolved pair)
-    - tfAnalyze/v1-resource: id|resource — stable across file renames; GitHub Code
-      Scanning uses the highest-specificity key that matches, so renaming a file
-      no longer floods the "fixed" view with false positives when the resource
-      name is preserved.
+    - tfAnalyze/v1-resource: id|resource — stable across file renames; only
+      emitted when the finding names a resource (an empty resource would
+      make every file-level finding of a rule share one key).
+
+    `uri` is the result's repo-relative URI, so a fingerprint does not
+    depend on where the repo was checked out. The line is deliberately
+    not part of the key (alerts must survive code moving); instead, when
+    several findings share a key, `to_sarif` numbers them in line order
+    and the n-th (n > 0) gets ``|#n`` — so they no longer collide and
+    merge into one alert.
     """
     import hashlib
     fid = finding.get("id", "UNKNOWN")
-    full_key = f"{fid}|{finding.get('file','')}|{finding.get('resource','')}"
-    resource_key = f"{fid}|{finding.get('resource','')}"
-    return {
-        "tfAnalyze/v1": hashlib.sha256(full_key.encode()).hexdigest()[:16],
-        "tfAnalyze/v1-resource": hashlib.sha256(resource_key.encode()).hexdigest()[:16],
-    }
+    file_key = finding.get("file", "") if uri is None else uri
+    resource = finding.get("resource", "")
+    full_key = f"{fid}|{file_key}|{resource}" + (f"|#{ordinal}" if ordinal else "")
+    out = {"tfAnalyze/v1": hashlib.sha256(full_key.encode()).hexdigest()[:16]}
+    if resource:
+        resource_key = f"{fid}|{resource}" + (
+            f"|#{resource_ordinal}" if resource_ordinal else ""
+        )
+        out["tfAnalyze/v1-resource"] = hashlib.sha256(resource_key.encode()).hexdigest()[:16]
+    return out
+
+
+SARIF_SRCROOT = "%SRCROOT%"
+
+
+def sarif_source_root(target: Path) -> Path:
+    """The directory SARIF URIs are relative to: the repository root (the
+    nearest ancestor holding `.git`), which is what GitHub Code Scanning
+    resolves them against, or `target` itself outside a repository."""
+    t = target.resolve()
+    for d in (t, *t.parents):
+        if (d / ".git").exists():
+            return d
+    return t
+
+
+def _sarif_uri(file: str, root: Path | None) -> tuple[str, bool]:
+    """``(uri, relative)`` for a finding's file. Under `root` the URI is
+    relative (and pairs with ``uriBaseId``); anything else keeps an
+    absolute ``file://`` URI rather than a bare local path."""
+    from urllib.parse import quote
+
+    if not file:
+        return "", False
+    p = Path(file)
+    if root is not None and p.is_absolute():
+        for cand in (p, p.resolve()):
+            try:
+                rel = cand.relative_to(root)
+            except ValueError:
+                continue
+            return quote(rel.as_posix(), safe="/"), True
+    if p.is_absolute():
+        return p.as_uri(), False
+    return quote(file.replace("\\", "/"), safe="/"), False
+
+
+def _artifact_location(uri: str, relative: bool) -> dict:
+    loc = {"uri": uri}
+    if relative:
+        loc["uriBaseId"] = SARIF_SRCROOT
+    return loc
 
 
 def _effective_urgency(finding: dict, entry: dict) -> str:
@@ -363,13 +436,14 @@ def _sarif_taxonomies(entries: list[dict]) -> list[dict]:
 def _sarif_rule_relationships(entry: dict) -> list[dict]:
     """Per-rule taxonomy references. Each entry produces one
     `relationships` element pointing at the matching taxon defined in
-    the run's `taxonomies` block."""
+    the run's `taxonomies` block. A `reportingDescriptorReference` target
+    takes `id` + `toolComponent` only; the taxon's `name` lives in
+    `taxonomies` (a `name` here fails the SARIF 2.1.0 schema)."""
     rels: list[dict] = []
     for cid in (entry.get("cwe") or []):
         rels.append({
             "target": {
                 "id": str(cid).removeprefix("CWE-"),
-                "name": str(cid),
                 "toolComponent": {"name": "CWE", "guid": _SARIF_TAXONOMY_DEFS["CWE"]["guid"]},
             },
             "kinds": ["relevant"],
@@ -378,7 +452,6 @@ def _sarif_rule_relationships(entry: dict) -> list[dict]:
         rels.append({
             "target": {
                 "id": str(tid),
-                "name": str(tid),
                 "toolComponent": {"name": "MITRE-ATT&CK", "guid": _SARIF_TAXONOMY_DEFS["MITRE-ATT&CK"]["guid"]},
             },
             "kinds": ["relevant"],
@@ -387,7 +460,6 @@ def _sarif_rule_relationships(entry: dict) -> list[dict]:
         rels.append({
             "target": {
                 "id": str(did),
-                "name": str(did),
                 "toolComponent": {"name": "MITRE-D3FEND", "guid": _SARIF_TAXONOMY_DEFS["MITRE-D3FEND"]["guid"]},
             },
             # D3FEND is a defensive countermeasure — different relationship
@@ -400,7 +472,6 @@ def _sarif_rule_relationships(entry: dict) -> list[dict]:
         rels.append({
             "target": {
                 "id": str(cis),
-                "name": f"CIS {cis}",
                 "toolComponent": {"name": "CIS", "guid": _SARIF_TAXONOMY_DEFS["CIS"]["guid"]},
             },
             "kinds": ["relevant"],
@@ -408,8 +479,39 @@ def _sarif_rule_relationships(entry: dict) -> list[dict]:
     return rels
 
 
-def to_sarif(findings: list[dict], entries: list[dict]) -> dict:
-    """Convert findings to SARIF v2.1.0 format with proper taxonomies."""
+def parse_fallback_notice(summary: dict | None) -> str:
+    """One-line notice for files python-hcl2 could not parse (scanned with
+    the regex fallback instead), or "" when there were none. Shared by the
+    text, HTML and pr-summary renderers (tasks/hcl-parser-migration.md §4.8).
+    """
+    files = (summary or {}).get("parse_fallback_files") or []
+    if not files:
+        return ""
+    names = [Path(f["file"]).name for f in files[:5]]
+    more = f" (+{len(files) - 5} more)" if len(files) > 5 else ""
+    return (
+        f"{len(files)} file(s) scanned in fallback mode "
+        f"(HCL parser could not read them): {', '.join(names)}{more}"
+    )
+
+
+def to_sarif(
+    findings: list[dict],
+    entries: list[dict],
+    parse_fallback_files: list[dict] | None = None,
+    *,
+    source_root: Path | None = None,
+) -> dict:
+    """Convert findings to SARIF v2.1.0 format with proper taxonomies.
+
+    With `source_root` (see `sarif_source_root`), file URIs are relative to
+    it and the run declares it as ``%SRCROOT%`` in ``originalUriBaseIds``,
+    so code scanning can map results to files in the repository.
+
+    Files the HCL parser could not read are tool diagnostics, not results:
+    each becomes a ``toolExecutionNotifications`` entry on the run's
+    invocation, so it never shows up as a code-scanning alert.
+    """
     rules = []
     rule_index = {}
     level_map = {
@@ -469,8 +571,29 @@ def to_sarif(findings: list[dict], entries: list[dict]) -> dict:
             rule_obj["relationships"] = rels
         rules.append(rule_obj)
 
+    # Number findings that would share a fingerprint key, in line order.
+    uris = [_sarif_uri(f.get("file") or "", source_root) for f in findings]
+    ordinals = [0] * len(findings)
+    resource_ordinals = [0] * len(findings)
+    groups: dict[tuple, list[int]] = {}
+    resource_groups: dict[tuple, list[int]] = {}
+    for i, f in enumerate(findings):
+        groups.setdefault(
+            (f.get("id"), uris[i][0], f.get("resource", "")), []
+        ).append(i)
+        if f.get("resource"):
+            resource_groups.setdefault((f.get("id"), f["resource"]), []).append(i)
+    for members, numbering in (
+        (groups, ordinals), (resource_groups, resource_ordinals),
+    ):
+        for idxs in members.values():
+            idxs.sort(key=lambda i: (uris[i][0], findings[i].get("line") or 0))
+            for n, i in enumerate(idxs):
+                numbering[i] = n
+    titles = {e["id"]: e.get("title") for e in entries}
+
     results = []
-    for f in findings:
+    for i, f in enumerate(findings):
         # Defensive `.get` throughout — a synthetic or externally-supplied
         # finding missing `resource`/`file`/`line` must not KeyError and
         # abort the ENTIRE SARIF emit (SARIF has no per-result safety net).
@@ -485,24 +608,40 @@ def to_sarif(findings: list[dict], entries: list[dict]) -> dict:
             # is handled automatically — but a literal newline in the
             # resource name would break some lax consumers. Strip
             # control characters defensively.
-            "message": {"text": _sarif_safe_text(f"Finding {fid} on {f.get('resource') or 'file'}")},
+            "message": {"text": _sarif_safe_text(
+                f"{titles[fid]} ({f.get('resource') or 'file'})" if titles.get(fid)
+                else f"Finding {fid} on {f.get('resource') or 'file'}"
+            )},
             "locations": [
                 {
                     "physicalLocation": {
                         # Audit fix #19 — URI normalization. Windows
                         # paths emit backslashes; SARIF expects URI
                         # form. Use forward slashes uniformly.
-                        "artifactLocation": {"uri": (f.get("file") or "").replace("\\", "/")},
+                        "artifactLocation": _artifact_location(*uris[i]),
                         "region": {"startLine": max(f.get("line") or 1, 1)},
                     }
                 }
             ],
-            "partialFingerprints": _sarif_fingerprint(f),
+            "partialFingerprints": _sarif_fingerprint(
+                f, uris[i][0], ordinals[i], resource_ordinals[i],
+            ),
         }
         if fid in rule_index:
             idx = rule_index[fid]
             result["ruleIndex"] = idx
             result["level"] = rules[idx]["defaultConfiguration"]["level"]
+        # The finding's own urgency (escalated, or adjusted by the attack
+        # graph), not the rule's default: an SSH-open-to-the-world finding
+        # is CRITICAL even though SEC-AWS-SG-001 defaults to HIGH, and was
+        # reported to code scanning as the default. `security-severity` is
+        # set per result too; GitHub documents it on the rule, so its score
+        # may still follow the rule — `level` is honoured per result.
+        if f.get("urgency") in level_map:
+            result["level"] = level_map[f["urgency"]]
+            result.setdefault("properties", {})["security-severity"] = (
+                severity_map[f["urgency"]]
+            )
         # KEV exploitability tag (R30.2). Surfaced at the per-result
         # level rather than per-rule so consumers can distinguish "this
         # specific finding hit a KEV-listed CWE" from "the rule could
@@ -530,13 +669,17 @@ def to_sarif(findings: list[dict], entries: list[dict]) -> dict:
         "tool": {
             "driver": {
                 "name": "tf-analyze",
-                "version": "1.2.0",
+                "version": __version__,
                 "informationUri": "https://github.com/ChrisAdkin8/tf-analyze",
                 "rules": rules,
             }
         },
         "results": results,
     }
+    if source_root is not None:
+        run["originalUriBaseIds"] = {
+            SARIF_SRCROOT: {"uri": source_root.as_uri().rstrip("/") + "/"},
+        }
     # Only declare supportedTaxonomies + the taxonomies block when at
     # least one rule references one — keeps SARIF lean on small repos.
     if taxonomies:
@@ -544,6 +687,27 @@ def to_sarif(findings: list[dict], entries: list[dict]) -> dict:
             {"name": t["name"], "guid": t["guid"]} for t in taxonomies
         ]
         run["taxonomies"] = taxonomies
+    if parse_fallback_files:
+        run["invocations"] = [{
+            "executionSuccessful": True,
+            "toolExecutionNotifications": [
+                {
+                    "level": "warning",
+                    "message": {
+                        "text": "HCL parser could not read this file; scanned "
+                                f"in fallback mode: {pf.get('reason', '')}",
+                    },
+                    "locations": [{
+                        "physicalLocation": {
+                            "artifactLocation": _artifact_location(
+                                *_sarif_uri(str(pf["file"]), source_root)
+                            ),
+                        },
+                    }],
+                }
+                for pf in parse_fallback_files
+            ],
+        }]
 
     return {
         "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
@@ -1253,7 +1417,7 @@ def _append_compliance_block(parts: list[str], compliance: dict) -> None:
                 rule_cells.append(f"**{link}**" if r in failed_rules else link)
             rule_str = ", ".join(rule_cells) or "—"
             parts.append(
-                f"| `{ctrl.get('control', '?')}` | {status_emoji} | {rule_str} |"
+                f"| {_md_code(ctrl.get('control', '?'))} | {status_emoji} | {rule_str} |"
             )
         parts.append("")
         parts.append("</details>")
@@ -1387,6 +1551,9 @@ def _render_pr_summary_impl(
         for tier in ("CRITICAL", "HIGH", "MEDIUM", "LOW")
     )
     parts.append(f"{counts_line} · {len(findings)} total")
+    _fallback = parse_fallback_notice(summary)
+    if _fallback:
+        parts.append(f"⚠️ {_fallback}")
     parts.append("")
 
     if not findings:
@@ -1437,7 +1604,10 @@ def _render_pr_summary_impl(
         _legacy_cent = {}
 
     def _rank_key(f: dict) -> tuple:
-        urg = entry_map.get(f["id"], {}).get("default_urgency", "INFO")
+        # The finding's own (escalated / reachability-adjusted) urgency,
+        # as the banner counts use — the catalogue default listed an
+        # escalated CRITICAL as HIGH and could rank it out of the top 3.
+        urg = _effective_urgency(f, entry_map.get(f["id"], {}))
         # Higher centrality → smaller key value (sort ascending).
         if cent_impact:
             c = -cent_impact.get(f["id"], 0.0)
@@ -1455,9 +1625,9 @@ def _render_pr_summary_impl(
     parts.append("|---|---|---|")
     for f in ranked[:3]:
         rid = f["id"]
-        urg = entry_map.get(rid, {}).get("default_urgency", "?")
+        urg = _effective_urgency(f, entry_map.get(rid, {}))
         title = entry_map.get(rid, {}).get("title", "")
-        loc = f"`{f.get('file','?')}:{f.get('line','?')}`"
+        loc = _md_code(f"{f.get('file','?')}:{f.get('line','?')}")
         # 🔥 KEV badge (R30.2) when the rule's CWE intersects CISA's
         # Known Exploited Vulnerabilities. Prepended to the urgency
         # cell so the visual landmark lands at column 1.
@@ -1499,7 +1669,7 @@ def _render_pr_summary_impl(
             br = int(f.get("blast_radius") or 0)
             resource = f.get("resource") or f.get("file", "?")
             rule_link = f"[`{rid}`]({RULE_DOCS_URL_BASE.format(id=rid)})"
-            parts.append(f"| **{br}** | {rule_link} | `{resource}` |")
+            parts.append(f"| **{br}** | {rule_link} | {_md_code(resource)} |")
         if len(high_blast) > 5:
             parts.append("")
             parts.append(
@@ -1855,8 +2025,8 @@ def to_html(
     suppressed_section = ""
     if suppressed:
         sups = "".join(
-            f"<li><code>{s['id']}</code> {s.get('file','')}:{s.get('line','')} — "
-            f"{s.get('suppression_reason','')}</li>"
+            f"<li><code>{_h(str(s['id']))}</code> {_h(str(s.get('file','')))}:"
+            f"{_h(str(s.get('line','')))} — {_h(str(s.get('suppression_reason','')))}</li>"
             for s in suppressed
         )
         suppressed_section = f"<h2>Suppressed ({len(suppressed)})</h2><ul>{sups}</ul>"
@@ -1903,6 +2073,13 @@ def to_html(
             f"</div>"
             f"</div>"
         )
+        _fallback = parse_fallback_notice(summary)
+        if _fallback:
+            summary_banner += (
+                f"<div style='background:#fff3cd;border-left:6px solid #b07d00;"
+                f"padding:.4em 1em;margin-bottom:1em;font-size:13px'>"
+                f"&#9888; {_h(_fallback)}</div>"
+            )
 
     tab_bar = ""
     tab_js = ""

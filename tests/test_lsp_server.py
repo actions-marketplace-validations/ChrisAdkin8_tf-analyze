@@ -27,6 +27,7 @@ fragile. A real subprocess is the same thing the user gets.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -54,7 +55,7 @@ class LspClient:
 
     def __init__(self) -> None:
         self.proc = subprocess.Popen(
-            [sys.executable, str(DETECT_PY), "--lsp", "--no-hcl2"],
+            [sys.executable, str(DETECT_PY), "--lsp"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -246,6 +247,43 @@ class TestLspDiagnostics:
         assert isinstance(d.get("message"), str) and d["message"]
         # Rule ID lives in either `code` or the structured `code` form per spec.
         assert d.get("code"), f"diagnostic missing rule ID: {d}"
+
+    def test_unparseable_file_gets_a_parse_fallback_diagnostic(
+        self, lsp: LspClient, tmp_path: Path,
+    ) -> None:
+        """A file python-hcl2 can't read is still scanned (regex fallback)
+        and the user is told once, as an Information diagnostic on line 1
+        (tasks/hcl-parser-migration.md §4.3)."""
+        if os.environ.get("TF_ANALYZE_TEST_FORCE_FALLBACK") == "1":
+            pytest.skip("parser disabled by the forced-fallback CI job")
+        tf = tmp_path / "main.tf"
+        tf.write_text(
+            'resource "aws_db_instance" "x" {\n'
+            '  storage_encrypted = false\n'
+            '  ingress { a = 1, b = 2 }\n'  # invalid HCL: commas
+            '}\n'
+        )
+        _initialize(lsp)
+        uri = _file_uri(tf)
+        lsp.send_notification("textDocument/didOpen", {
+            "textDocument": {
+                "uri": uri, "languageId": "terraform", "version": 1,
+                "text": tf.read_text(),
+            }
+        })
+        msg = lsp.read_until(
+            lambda m: m.get("method") == "textDocument/publishDiagnostics"
+                      and m.get("params", {}).get("uri") == uri,
+            timeout=10.0,
+        )
+        diags = msg["params"]["diagnostics"]
+        notes = [d for d in diags if d.get("code") == "tf-analyze/parse-fallback"]
+        assert len(notes) == 1, diags
+        assert notes[0]["severity"] == 3
+        assert notes[0]["range"]["start"]["line"] == 0
+        assert "fallback mode" in notes[0]["message"]
+        # The file was still scanned: real rule diagnostics are present too.
+        assert any(d.get("code") != "tf-analyze/parse-fallback" for d in diags), diags
 
     def test_did_close_clears_diagnostics(
         self, lsp: LspClient, tmp_path: Path,
@@ -622,3 +660,67 @@ class TestLspCapabilitiesPinned:
         # version is present and looks semver-ish — we don't pin the
         # exact value because the LSP advertises 0.1.0 historically.
         assert isinstance(info.get("version"), str)
+
+
+# ---------------------------------------------------------------------------
+# URIs with escapes, and the editor's unsaved text
+# ---------------------------------------------------------------------------
+
+_RDS_UNENCRYPTED = (
+    'resource "aws_db_instance" "x" {\n'
+    '  identifier        = "demo"\n'
+    '  engine            = "postgres"\n'
+    '  storage_encrypted = false\n'
+    '}\n'
+)
+
+
+def _diagnostics_for(lsp: LspClient, uri: str) -> list[dict]:
+    msg = lsp.read_until(
+        lambda m: m.get("method") == "textDocument/publishDiagnostics"
+                  and m.get("params", {}).get("uri") == uri,
+        timeout=10.0,
+    )
+    return msg["params"]["diagnostics"]
+
+
+class TestLspUrisAndBuffers:
+    def test_path_with_a_space_gets_diagnostics(self, lsp: LspClient, tmp_path: Path) -> None:
+        # `Path.as_uri()` percent-encodes the space (`my%20dir`); the server
+        # used to strip `file://` only and look for a file that isn't there.
+        folder = tmp_path / "my dir"
+        folder.mkdir()
+        tf = folder / "main.tf"
+        tf.write_text(_RDS_UNENCRYPTED)
+        uri = tf.as_uri()
+        assert "%20" in uri
+        _initialize(lsp)
+        lsp.send_notification("textDocument/didOpen", {
+            "textDocument": {"uri": uri, "languageId": "terraform", "version": 1,
+                             "text": tf.read_text()},
+        })
+        assert _diagnostics_for(lsp, uri), "no diagnostics for a path with a space"
+
+    def test_did_change_scans_the_unsaved_text(self, lsp: LspClient, tmp_path: Path) -> None:
+        tf = tmp_path / "main.tf"
+        tf.write_text('locals {\n  x = 1\n}\n')  # clean on disk
+        uri = tf.as_uri()
+        _initialize(lsp)
+        lsp.send_notification("textDocument/didOpen", {
+            "textDocument": {"uri": uri, "languageId": "terraform", "version": 1,
+                             "text": tf.read_text()},
+        })
+        assert not any(d.get("code") == "SEC-AWS-RDS-002" for d in _diagnostics_for(lsp, uri))
+        lsp.send_notification("textDocument/didChange", {
+            "textDocument": {"uri": uri, "version": 2},
+            "contentChanges": [{"text": _RDS_UNENCRYPTED}],
+        })
+        codes = {d.get("code") for d in _diagnostics_for(lsp, uri)}
+        assert "SEC-AWS-RDS-002" in codes, codes  # from the buffer, not the file
+
+
+def test_uri_to_path_decodes_and_handles_windows_drives() -> None:
+    from _lsp import _uri_to_path
+
+    assert str(_uri_to_path("file:///home/me/my%20dir/main.tf")) == "/home/me/my dir/main.tf"
+    assert _uri_to_path("file://localhost/tmp/a.tf") == Path("/tmp/a.tf")

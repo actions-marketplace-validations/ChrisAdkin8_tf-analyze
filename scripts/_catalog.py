@@ -8,8 +8,8 @@ external caller consumes.
 Scope rule — same as `_versions.py`, `_scoring.py`, `_hcl.py`:
 
   * Pure functions and immutable validation constants only.
-  * No engine state. The `_USE_HCL2` toggle, the var-resolution
-    layer, the runtime catalogue index — all stay in `detect.py`.
+  * No engine state. The var-resolution layer and the runtime
+    catalogue index stay in `detect.py`.
   * I/O is allowed when it's the gateway between the filesystem and
     a structured Python value (file → YAML → dict, same shape as
     `_hcl._read_normalized`).
@@ -104,6 +104,24 @@ _REQUIRED_FIELDS = (
 # ---- Minimal YAML loader -----------------------------------------------
 # Avoid PyYAML dependency. Catalogue YAML is shallow and well-formed.
 
+def _strip_yaml_comment(line: str) -> str:
+    """`line` without a trailing YAML comment: a `#` outside quotes that
+    starts the line or follows whitespace. List items used to keep theirs
+    (`- kind: grep  # note` gave the unknown kind `grep  # note`, so a
+    custom rule silently never ran), and other lines cut at any `#`, even
+    one inside a quoted regex (`'(?m)^\\s*#'`)."""
+    quote = ""
+    for i, ch in enumerate(line):
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in "'\"" and (i == 0 or line[i - 1] in " \t:-[{,"):
+            quote = ch
+        elif ch == "#" and (i == 0 or line[i - 1] in " \t"):
+            return line[:i].rstrip()
+    return line
+
+
 def load_yaml(text: str) -> dict:
     """Tiny YAML parser for the catalogue subset we control."""
     root: dict = {}
@@ -112,8 +130,7 @@ def load_yaml(text: str) -> dict:
     i = 0
     while i < len(lines):
         raw = lines[i]
-        # Strip comments outside of strings (catalogue values don't contain `#`)
-        line = raw.split("#", 1)[0] if not raw.lstrip().startswith("- ") else raw
+        line = _strip_yaml_comment(raw)
         if not line.strip():
             i += 1
             continue
@@ -254,6 +271,41 @@ def validate_catalog_entry(data: dict, source: str) -> list[str]:
                         errs.append(f"{source}: patterns[{i}].{field} — invalid policy expression: {exc}")
     elif pats is not None:
         errs.append(f"{source}: 'patterns' must be a list")
+    # `escalation:` (tasks/hcl-parser-migration.md §4.10): each item raises
+    # urgency. A structured `match:` mapping is evaluated by the engine
+    # (`ports: [int, ...]` for network rules, else attribute path -> regex);
+    # an item with only a free-text `condition:` is read by the skill's
+    # judgement pass. An item with neither would silently never apply.
+    esc = data.get("escalation")
+    if esc is not None and not isinstance(esc, list):
+        errs.append(f"{source}: 'escalation' must be a list")
+    for i, x in enumerate(esc if isinstance(esc, list) else []):
+        if not isinstance(x, dict):
+            errs.append(f"{source}: escalation[{i}] is not a mapping")
+            continue
+        target = x.get("urgency") or x.get("new_urgency")
+        if target not in _VALID_URGENCIES:
+            errs.append(f"{source}: escalation[{i}] needs 'urgency' (or 'new_urgency') "
+                        f"in {sorted(_VALID_URGENCIES)}")
+        match = x.get("match")
+        if match is None and not x.get("condition"):
+            errs.append(f"{source}: escalation[{i}] needs a structured 'match' or a 'condition'")
+        if match is not None:
+            if not isinstance(match, dict) or not match:
+                errs.append(f"{source}: escalation[{i}].match must be a non-empty mapping")
+                continue
+            for key, want in match.items():
+                if key == "ports":
+                    # The stdlib YAML loader yields flow-list items as
+                    # strings, so accept anything int() takes.
+                    if not (isinstance(want, list) and want
+                            and all(str(v).strip().isdigit() for v in want)):
+                        errs.append(f"{source}: escalation[{i}].match.ports must be a list of port numbers")
+                    continue
+                try:
+                    re.compile(str(want))
+                except re.error as exc:
+                    errs.append(f"{source}: escalation[{i}].match.{key} — invalid regex: {exc}")
     narrative = data.get("narrative")
     if narrative is not None and not isinstance(narrative, str):
         errs.append(f"{source}: 'narrative' must be a string if present")
@@ -475,6 +527,46 @@ def _load_project_config(target: Path) -> dict:
         return {}
 
 
+# Pattern kinds that test each resource of the named type, so a
+# `kubernetes_X` pattern also applies to `kubernetes_X_v1` (see
+# `kubernetes_type_aliases`). Absence kinds handle aliases themselves.
+_PER_RESOURCE_KINDS = frozenset({
+    "resource_arg", "resource_missing_arg", "resource_present",
+    "resource_body_contains", "hcl_attr",
+})
+
+
+def kubernetes_type_aliases(rtype: str) -> tuple[str, ...]:
+    """`rtype` plus its API-versioned alias: the kubernetes provider names
+    the current form of most resources `kubernetes_X_v1` and keeps
+    `kubernetes_X` as the older one, so a rule written for one must cover
+    both (`kubernetes_cluster_role_binding_v1` -> cluster-admin was missed)."""
+    if not rtype.startswith("kubernetes_"):
+        return (rtype,)
+    if rtype.endswith("_v1"):
+        return (rtype, rtype[: -len("_v1")])
+    if rtype.endswith("_v1beta1"):
+        return (rtype,)
+    return (rtype, rtype + "_v1")
+
+
+def _with_kubernetes_aliases(patterns: list) -> list:
+    """`patterns` plus a `_v1` copy of each per-resource pattern on a
+    `kubernetes_*` type that the entry does not already declare."""
+    out = list(patterns)
+    for p in patterns:
+        if not isinstance(p, dict) or p.get("kind") not in _PER_RESOURCE_KINDS:
+            continue
+        rtype = p.get("resource")
+        if not isinstance(rtype, str):
+            continue
+        for alias in kubernetes_type_aliases(rtype)[1:]:
+            copy = {**p, "resource": alias}
+            if copy not in out:
+                out.append(copy)
+    return out
+
+
 def load_catalog(
     catalog_dir: Path,
     include_stubs: bool = False,
@@ -517,6 +609,7 @@ def load_catalog(
             continue
         if status == "stub" and not include_stubs:
             continue
+        data["patterns"] = _with_kubernetes_aliases(data.get("patterns") or [])
         entries.append(data)
     if strict and error_count:
         print(
@@ -551,6 +644,7 @@ def load_catalog(
                 continue
             if status == "stub" and not include_stubs:
                 continue
+            data["patterns"] = _with_kubernetes_aliases(data.get("patterns") or [])
             entries.append(data)
 
     return entries

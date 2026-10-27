@@ -26,7 +26,7 @@ against their working copy of `detect.py`), not user features.
 
 **From the `.vsix` (the only supported user path):**
 ```bash
-code --install-extension tf-analyze-0.1.57.vsix
+code --install-extension tf-analyze-0.1.58.vsix
 ```
 
 That's it. Open any Terraform workspace and the status-bar items
@@ -50,8 +50,8 @@ ext install hashicorp.tf-analyze
 ## Requirements
 
 - VS Code 1.85+
-- Python 3.9+ on `$PATH` (the bundled `detect.py` uses Python stdlib only —
-  no `pip install` step required)
+- Python 3.9+ on `$PATH` (the bundled engine needs only the stdlib plus its
+  bundled HCL parser — no `pip install` step required)
 
 ## Features
 
@@ -152,7 +152,7 @@ The `tf-analyze: Run Scan` command remains exec-based — it covers the whole wo
 
 ### Baseline / suppression
 
-Right-click any row in the **Findings** tree → **Suppress finding (add to baseline)** to write the (id, file, line, resource) tuple to `<workspace>/.tf-analyze-baseline.json`. Subsequent scans automatically pick up the baseline file and suppress matching findings. **Unsuppress finding** reverses it; **Open Baseline File** loads the JSON in the editor for bulk edits.
+Right-click any row in the **Findings** tree → **Suppress finding (add to baseline)** to write the finding to `<workspace>/.tf-analyze-baseline.json`. Subsequent scans automatically pick up the baseline file and suppress matching findings — matched by rule, file and resource, so the suppression survives the line moving. **Unsuppress finding** reverses it; **Open Baseline File** loads the JSON in the editor for bulk edits.
 
 ### MITRE ATT&CK view
 

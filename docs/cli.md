@@ -42,11 +42,11 @@ Execution mode. fleet: multi-repo scan. trend: risk trajectory over git history.
 
 ### `--prior-report PRIOR_REPORT`
 
-Markdown report to verify (for --mode verify-fixed). If omitted, picks the most recent tf-analysis-*.md under reports/.
+Report to verify (for --mode verify-fixed): a markdown report, or this CLI's --format json / text output. If omitted, picks the most recent tf-analysis-*.md under reports/. Exits 1 under --fail-on when a STILL-PRESENT or MOVED finding meets the threshold.
 
 ### `--diff-base DIFF_BASE`
 
-Git ref to diff against (e.g., main). Only scan changed .tf files.
+Git ref to diff against (e.g., main). Only scan changed .tf / .tf.json files.
 
 ### `--plan-json PATH`
 
@@ -93,7 +93,7 @@ Auto-discover most recent prior JSON report and compute delta.
 
 **Choices:** `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `INFO`
 
-Exit with code 1 if any finding at this urgency or above exists
+Exit with code 1 if any finding at this urgency or above exists, or if a file could not be read or a rule check ran out of time. Exit with code 2 if no .tf / .tf.json files were found to scan (unless --plan-json or --state-json supplies the input)
 
 
 ## Auto-stub
@@ -105,13 +105,6 @@ Directory to write auto-generated catalogue stubs. Combined with --propose-stub 
 ### `--propose-stub PROPOSE_STUB`
 
 Comma-separated list of exploratory IDs to scaffold as stubs. Used by the judgement pass to promote novel findings. Requires --auto-stub <dir>.
-
-
-## Optional fast-path
-
-### `--use-hcl2`
-
-[deprecated, default-on since v0.2] Enable python-hcl2 fast-path. Kept for backwards compat; behaviour is now controlled by --no-hcl2.
 
 
 ## Meta-commands
@@ -135,6 +128,10 @@ Scaffold a new catalogue entry and fixture skeleton for the given ID (must match
 
 show this help message and exit
 
+### `--version`
+
+Print the tf-analyze version and exit
+
 ### `--targets-file`
 
 File containing one target directory path per line (for --mode fleet).
@@ -142,6 +139,10 @@ File containing one target directory path per line (for --mode fleet).
 ### `--config`
 
 Path to .tf-analyze.yaml project config file. Default: auto-discover in target directory.
+
+### `--no-project-config`
+
+Ignore .tf-analyze.yaml. In CI on untrusted pull requests the scanned repo controls that file, and its ignore_rules / ignore_paths / rules_dir can switch the gate off; pair with --no-suppress for the ignore file and inline comments.
 
 ### `--init`
 
@@ -158,6 +159,10 @@ When a catalogue entry carries a `fix_hcl` snippet, render it alongside each fin
 ### `--show-info`
 
 Include INFO-tier findings (advisory; e.g. module-reuse suggestions) in output. Default off — INFO findings are counted in the summary but not rendered.
+
+### `--fail-on-parse-error`
+
+Exit with code 1 if any .tf file could not be parsed and was scanned in the less precise regex fallback mode
 
 ### `--mitre-tactic`
 
@@ -225,49 +230,25 @@ Disable network fetches for CISA KEV / FIRST.org EPSS. Falls back to cache if pr
 
 ### `--baseline`
 
-Path to a baseline JSON report. Findings present in the baseline are suppressed (counted under `suppressed_by_baseline` in JSON output) so only NEW findings affect the exit code. Match key: (id, file, line, resource). Use to ratchet a legacy repo: snapshot today's findings, then enforce no regressions going forward.
+Path to a baseline JSON report. Findings present in the baseline are suppressed (counted under `suppressed_by_baseline` in JSON output) so only NEW findings affect the exit code. Findings match by rule, file (relative to the target) and resource — not the line, so code moving or a different checkout folder doesn't make a known finding new. Use to ratchet a legacy repo: snapshot today's findings, then enforce no regressions going forward.
 
 ### `--cache`
 
-Enable incremental scan caching. Stores findings keyed on a hash of all .tf file contents + catalogue entries in .tf-analyze-cache.json inside the target directory. Subsequent runs on unchanged code return the cached findings instantly. Cache is invalidated automatically when any .tf file or catalogue rule changes. Use --cache-file to override the path.
+Enable incremental scan caching. Stores findings keyed on a hash of all .tf file contents + catalogue entries in a per-target file under the user cache dir (never inside the target, so a committed cache file cannot replay findings). Subsequent runs on unchanged code return the cached findings instantly. Cache is invalidated automatically when any .tf file or catalogue rule changes. Use --cache-file to override the path.
 
 ### `--cache-file`
 
-Override the cache file path used by --cache (default: <target>/.tf-analyze-cache.json).
+Override the cache file path used by --cache (default: a per-target file under the user cache dir).
 
 ### `--apply-fixes`
 
-Auto-apply fix_hcl patches for fixable findings. 'dry-run' prints a unified diff to stdout without writing files. 'apply' writes the patched files to disk (creates .bak backups). Only resource_missing_arg and resource_arg/hcl_attr patterns are patched; patterns without fix_hcl are skipped. Always review dry-run output before applying.
+Auto-apply fix_hcl patches for fixable findings. 'dry-run' prints a unified diff to stdout without writing files. 'apply' writes the patched files to disk (creates .bak backups). Only resource_missing_arg and resource_arg/hcl_attr patterns are patched; patterns without fix_hcl are skipped. Always review dry-run output before applying. 'apply' exits 0 after patching and does not apply --fail-on: re-run the scan to gate on what is left.
 
 ### `--apply-fixes-max-disruption`
 
 Cap which findings --apply-fixes will touch by their fix_disruption tier. Default is 'forces_replacement' (no cap — every fixable finding is applied). 'none' applies only non-disruptive fixes (the auto-remediation-bot default). 'plan_required' applies non-disruptive plus changes visible in `terraform plan` but not forcing replacement. Tier ordering: none < plan_required < forces_replacement.
 
-### `--no-hcl2`
-
-Disable the python-hcl2 fast-path and use the regex parser exclusively. Useful for benchmarking or when running in a constrained environment without the optional dependency.
-
 ### `--lsp`
 
 Run as a JSON-RPC 2.0 LSP server on stdin/stdout. Provides real-time diagnostics and code actions for .tf files.
-
-### `--stdio`
-
-==SUPPRESS==
-
-### `--node-ipc`
-
-==SUPPRESS==
-
-### `--socket`
-
-==SUPPRESS==
-
-### `--port`
-
-==SUPPRESS==
-
-### `--clientProcessId`
-
-==SUPPRESS==
 

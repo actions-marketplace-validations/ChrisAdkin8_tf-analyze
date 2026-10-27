@@ -1,17 +1,17 @@
 [project]
 name = "tf-analyze"
-version = "0.2.6"
+dynamic = ["version"]
 description = "Terraform static analysis and security scanner"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MPL-2.0" }
+license = { text = "Apache-2.0" }
 keywords = ["terraform", "security", "static-analysis", "iac"]
 
 [project.scripts]
 tf-analyze = "detect:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-xdist>=3.5", "hypothesis>=6.0"]
+dev = ["pytest>=8.0", "pytest-xdist>=3.5", "pytest-timeout>=2.3", "hypothesis>=6.0", "pyyaml>=6.0", "jsonschema>=4.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -25,10 +25,25 @@ build-backend = "setuptools.build_meta"
 # each other as `from _hcl import ...`, so they must install top-level, not
 # under a package). The rule catalogue ships as the `tf_analyze_catalog` data
 # package so the installed console script can locate the YAML rules; see
-# `detect._default_catalog_dir()`.
+# `detect._default_catalog_dir()`. The vendored HCL parser (python-hcl2 +
+# lark, refreshed by scripts/vendor_deps.py) ships the same way as
+# `tf_analyze_vendor`; `_hcl._vendor_dir()` puts it on sys.path. It is
+# deliberately not a [project] dependency: the vendored copy always wins,
+# so every surface runs one parser version.
 [tool.setuptools]
-package-dir = { "" = "scripts", "tf_analyze_catalog" = "catalog" }
-packages = ["tf_analyze_catalog"]
+package-dir = { "" = "scripts", "tf_analyze_catalog" = "catalog", "tf_analyze_vendor" = "scripts/_vendor" }
+# Every vendored package dir must be listed (tests/test_vendored_parser.py
+# keeps this in sync with scripts/_vendor/).
+packages = [
+    "tf_analyze_catalog",
+    "tf_analyze_vendor",
+    "tf_analyze_vendor.hcl2",
+    "tf_analyze_vendor.lark",
+    "tf_analyze_vendor.lark.__pyinstaller",
+    "tf_analyze_vendor.lark.grammars",
+    "tf_analyze_vendor.lark.parsers",
+    "tf_analyze_vendor.lark.tools",
+]
 py-modules = [
     "detect",
     "_apply_fixes",
@@ -46,18 +61,34 @@ py-modules = [
     "_handlers_robustness",
     "_handlers_security",
     "_hcl",
+    "_iam_policy",
     "_lsp",
+    "_meta",
     "_mitre",
     "_modes",
+    "_network",
     "_output",
     "_plan_state",
     "_policy",
     "_registry",
     "_scoring",
+    "_tfjson",
     "_threat_intel",
     "_verify",
     "_versions",
 ]
 
+[tool.setuptools.dynamic]
+# Single source of truth: scripts/_meta.py (also read by --version, SARIF
+# and the LSP server; the release workflow checks the tag against it).
+version = { attr = "_meta.__version__" }
+
 [tool.setuptools.package-data]
 tf_analyze_catalog = ["*.yaml", "*.md"]
+tf_analyze_vendor = ["VERSIONS", "LICENSE.*"]
+"tf_analyze_vendor.hcl2" = ["*.lark", "py.typed"]
+"tf_analyze_vendor.lark" = ["py.typed"]
+"tf_analyze_vendor.lark.grammars" = ["*.lark"]
+
+[tool.setuptools.exclude-package-data]
+"tf_analyze_vendor.hcl2" = [".lark_cache.bin"]

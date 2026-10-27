@@ -20,7 +20,7 @@ DETECT_PY = REPO_ROOT / "scripts" / "detect.py"
 
 def _run(*argv: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [sys.executable, str(DETECT_PY), "--no-hcl2", *argv],
+        [sys.executable, str(DETECT_PY), *argv],
         capture_output=True, text=True, timeout=120,
         cwd=str(cwd) if cwd else None,
     )
@@ -102,7 +102,8 @@ def test_verify_fixed_json_happy_path(tmp_path: Path) -> None:
     data = json.loads(res.stdout)
     assert data["total_prior"] == 1
     assert set(data["results"]) == {
-        "STILL-PRESENT", "RESOLVED", "MOVED", "STALE-LOCATION", "AMBIGUOUS"
+        "STILL-PRESENT", "RESOLVED", "MOVED", "STALE-LOCATION", "BROKEN-SYMLINK", "AMBIGUOUS",
+        "UNREADABLE",
     }
 
 

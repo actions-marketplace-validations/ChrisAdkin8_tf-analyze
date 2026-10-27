@@ -7,9 +7,9 @@ table by virtue of the ``@_register_infile`` / ``@_register_corpus``
 decorator on its definition; importing this module is what triggers
 the registration. See the matching block in ``detect.py``.
 
-In-file handlers (5):
+In-file handlers (6):
     variable_credential_pattern, iam_policy_analysis, helm_set_value,
-    iam_json_policy_analysis, firewall_open_port
+    iam_json_policy_analysis, firewall_open_port, high_entropy_string
 
 Corpus handlers (4):
     output_sensitive_leak, cross_module, templatefile_sensitive_leak,
@@ -17,6 +17,7 @@ Corpus handlers (4):
 """
 from __future__ import annotations
 
+import math
 import re
 from pathlib import Path
 
@@ -24,8 +25,18 @@ from _hcl import (
     find_blocks,
     block_arg_value,
     brace_walk,
+    mask_comments_and_heredocs,
+    parse_tf,
+    strip_hcl_context,
     _hcl_object_to_json,
 )
+from _iam_policy import (
+    argument_policies,
+    document_statements,
+    json_statements,
+    policy_document_subtrees,
+)
+from _tfjson import is_tf_source
 from detect import (
     InFileCtx,
     CorpusCtx,
@@ -38,7 +49,9 @@ from detect import (
     RESOURCE_START,
     SENSITIVE_TRUE_RE,
     VAR_REF_RE,
+    _resource_is_count_zero,
 )
+from _network import view_for, world_open_rules
 
 
 # ---- In-file handlers ---------------------------------------------------
@@ -90,70 +103,93 @@ def _detect_iam_policy_analysis(c: InFileCtx) -> list[dict]:
     * ``wildcard_action_and_resource`` — both action and resource ``"*"``
     * ``not_action_or_not_resource`` — uses NotAction/NotResource
 
-    Uses the shared ``brace_walk`` for both the outer statement and
-    inner principals blocks (quote-aware — an action ARN containing
-    ``bucket-{*}-policy`` no longer corrupts the depth count).
+    Statements come from the parse tree (``_iam_policy``), which also
+    sees ``dynamic "statement"`` blocks. A file that did not parse, or a
+    document name seen twice, falls back to the text walk below.
     """
     check = c.pat.get("check")
     if not check:
         return []
     out: list[dict] = []
+    tree = parse_tf(c.text)[0] if is_tf_source(c.file_path) else None
+    documents = policy_document_subtrees(tree)
     for dblk in find_blocks(c.text, DATA_START):
         dtype, dname = dblk["groups"]
         if dtype != "aws_iam_policy_document":
             continue
-        body = dblk["body"]
-        for sm in re.finditer(r'(?m)^\s*statement\s*\{', body):
-            s_end_after = brace_walk(body, sm.end() - 1)
-            if s_end_after is None:
+        subtrees = documents.get(dname, [])
+        if len(subtrees) == 1:
+            for st in document_statements(subtrees[0]):
+                if st.matches(check):
+                    out.append({
+                        "id": c.eid,
+                        "file": str(c.file_path),
+                        "line": st.line or dblk["start_line"],
+                        "resource": f"data.aws_iam_policy_document.{dname}",
+                    })
+            continue
+        out.extend(_legacy_policy_document(c, check, dblk, dname))
+    return out
+
+
+def _legacy_policy_document(
+    c: InFileCtx, check: str, dblk: dict, dname: str,
+) -> list[dict]:
+    """Text walk of one ``aws_iam_policy_document`` block — the regex
+    fallback for a file the parser could not read."""
+    out: list[dict] = []
+    body = dblk["body"]
+    for sm in re.finditer(r'(?m)^\s*statement\s*\{', body):
+        s_end_after = brace_walk(body, sm.end() - 1)
+        if s_end_after is None:
+            continue
+        s_end = s_end_after - 1
+        sbody = body[sm.end():s_end]
+        eff = block_arg_value(sbody, "effect")
+        if eff and eff.strip().strip('"').lower() == "deny":
+            continue
+        actions = block_arg_value(sbody, "actions") or ""
+        resources_l = block_arg_value(sbody, "resources") or ""
+        not_actions = block_arg_value(sbody, "not_actions") or ""
+        not_resources = block_arg_value(sbody, "not_resources") or ""
+        has_wild_action = '"*"' in actions
+        has_wild_resource = '"*"' in resources_l
+        has_iam_wild = bool(re.search(r'"iam:[^"]*\*"', actions))
+        has_public_principal = False
+        for pm in re.finditer(r'(?m)^\s*principals\s*\{', sbody):
+            p_end_after = brace_walk(sbody, pm.end() - 1)
+            if p_end_after is None:
                 continue
-            s_end = s_end_after - 1
-            sbody = body[sm.end():s_end]
-            eff = block_arg_value(sbody, "effect")
-            if eff and eff.strip().strip('"').lower() == "deny":
-                continue
-            actions = block_arg_value(sbody, "actions") or ""
-            resources_l = block_arg_value(sbody, "resources") or ""
-            not_actions = block_arg_value(sbody, "not_actions") or ""
-            not_resources = block_arg_value(sbody, "not_resources") or ""
-            has_wild_action = '"*"' in actions
-            has_wild_resource = '"*"' in resources_l
-            has_iam_wild = bool(re.search(r'"iam:[^"]*\*"', actions))
-            has_public_principal = False
-            for pm in re.finditer(r'(?m)^\s*principals\s*\{', sbody):
-                p_end_after = brace_walk(sbody, pm.end() - 1)
-                if p_end_after is None:
-                    continue
-                p_end = p_end_after - 1
-                pbody = sbody[pm.end():p_end]
-                ids = block_arg_value(pbody, "identifiers") or ""
-                if '"*"' in ids:
-                    has_public_principal = True
-                    break
-            triggered = False
-            if check == "wildcard_action" and has_wild_action:
-                triggered = True
-            elif check == "wildcard_resource" and has_wild_resource:
-                triggered = True
-            elif check == "public_principal" and has_public_principal:
-                triggered = True
-            elif check == "wildcard_action_iam" and has_iam_wild:
-                triggered = True
-            elif (check == "wildcard_action_and_resource"
-                  and has_wild_action and has_wild_resource):
-                triggered = True
-            elif check == "not_action_or_not_resource" and (
-                not_actions or not_resources
-            ):
-                triggered = True
-            if triggered:
-                stmt_line = dblk["start_line"] + body[: sm.start()].count("\n")
-                out.append({
-                    "id": c.eid,
-                    "file": str(c.file_path),
-                    "line": stmt_line,
-                    "resource": f"data.aws_iam_policy_document.{dname}",
-                })
+            p_end = p_end_after - 1
+            pbody = sbody[pm.end():p_end]
+            ids = block_arg_value(pbody, "identifiers") or ""
+            if '"*"' in ids:
+                has_public_principal = True
+                break
+        triggered = False
+        if check == "wildcard_action" and has_wild_action:
+            triggered = True
+        elif check == "wildcard_resource" and has_wild_resource:
+            triggered = True
+        elif check == "public_principal" and has_public_principal:
+            triggered = True
+        elif check == "wildcard_action_iam" and has_iam_wild:
+            triggered = True
+        elif (check == "wildcard_action_and_resource"
+              and has_wild_action and has_wild_resource):
+            triggered = True
+        elif check == "not_action_or_not_resource" and (
+            not_actions or not_resources
+        ):
+            triggered = True
+        if triggered:
+            stmt_line = dblk["start_line"] + body[: sm.start()].count("\n")
+            out.append({
+                "id": c.eid,
+                "file": str(c.file_path),
+                "line": stmt_line,
+                "resource": f"data.aws_iam_policy_document.{dname}",
+            })
     return out
 
 
@@ -174,36 +210,71 @@ def _detect_helm_set_value(c: InFileCtx) -> list[dict]:
         btype, bname = blk["groups"]
         if btype != "helm_release":
             continue
-        body = blk["body"]
-        for sm in re.finditer(r'(?m)^\s*set\s*\{', body):
-            end_after = brace_walk(body, sm.end() - 1)
-            if end_after is None:
-                continue
-            end = end_after - 1
-            sbody = body[sm.end():end]
-            n = block_arg_value(sbody, "name") or ""
-            v = block_arg_value(sbody, "value") or ""
-            if n.strip() == target_name and vrx.search(str(v)):
-                out.append({
-                    "id": c.eid,
-                    "file": str(c.file_path),
-                    "line": blk["start_line"],
-                    "resource": f"helm_release.{bname}",
-                })
-                break
+        if any(
+            n.strip() == target_name and vrx.search(v)
+            for n, v in _helm_set_pairs(blk)
+        ):
+            out.append({
+                "id": c.eid,
+                "file": str(c.file_path),
+                "line": blk["start_line"],
+                "resource": f"helm_release.{bname}",
+            })
     return out
+
+
+def _helm_set_pairs(blk: dict) -> list[tuple[str, str]]:
+    """``(name, value)`` of every override on a `helm_release`: the helm
+    provider v2 `set { ... }` blocks and the v3 `set = [{ ... }, ...]`
+    list (v3 was missed entirely). From the parse tree when the file
+    parsed — both forms are a list of `{name, value}` there — else from
+    the text."""
+    attrs = blk.get("attrs")
+    if attrs is not None:
+        sets = attrs.get("set") or []
+        if isinstance(sets, dict):
+            sets = [sets]
+        return [
+            (str(item.get("name", "")), str(item.get("value", "")))
+            for item in sets if isinstance(item, dict)
+        ]
+    body = blk["body"]
+    code = mask_comments_and_heredocs(body)
+    spans: list[tuple[int, int]] = []
+    for sm in re.finditer(r'(?m)^\s*set\s*\{', code):
+        end_after = brace_walk(body, sm.end() - 1)
+        if end_after is not None:
+            spans.append((sm.end(), end_after - 1))
+    for lm in re.finditer(r'(?m)^\s*set\s*=\s*\[', code):
+        list_end = brace_walk(body, lm.end() - 1, opens="[", closes="]")
+        if list_end is None:
+            continue
+        i = lm.end()
+        while (j := code.find("{", i, list_end)) != -1:
+            item_end = brace_walk(body, j)
+            if item_end is None:
+                break
+            spans.append((j + 1, item_end - 1))
+            i = item_end
+    return [
+        (block_arg_value(body[a:b], "name") or "", block_arg_value(body[a:b], "value") or "")
+        for a, b in spans
+    ]
 
 
 @_register_infile("iam_json_policy_analysis")
 def _detect_iam_json_policy_analysis(c: InFileCtx) -> list[dict]:
     """``iam_json_policy_analysis`` — inline JSON-policy analysis on
-    resources like ``aws_iam_policy`` / ``aws_iam_role_policy`` whose
-    ``policy`` argument is ``jsonencode({...})``. The same ``check``
-    vocabulary as ``iam_policy_analysis`` (wildcard_action, etc.).
+    resources like ``aws_iam_policy`` / ``aws_iam_role_policy``. The same
+    ``check`` vocabulary as ``iam_policy_analysis`` (wildcard_action, etc.).
 
-    The ``jsonencode(...)`` call body is extracted via ``brace_walk``
-    with paren delimiters, then run through ``_hcl_object_to_json``
-    for structural inspection.
+    Pattern fields: ``resources`` (resource types) and ``args`` (the
+    policy-valued arguments, default ``[policy]``; e.g.
+    ``assume_role_policy``). Each argument may hold ``jsonencode({...})``,
+    a heredoc or a quoted JSON string; an ``inline_policy`` block's
+    ``policy`` is read too. Policies come from the parse tree
+    (``_iam_policy``); a file that did not parse falls back to the text
+    path below, which reads ``policy = jsonencode(...)`` only.
     """
     check = c.pat.get("check")
     resource_types = c.pat.get("resources") or [
@@ -211,7 +282,9 @@ def _detect_iam_json_policy_analysis(c: InFileCtx) -> list[dict]:
         "aws_iam_role_policy",
         "aws_iam_user_policy",
         "aws_iam_group_policy",
+        "aws_iam_role",  # its `inline_policy` blocks
     ]
+    args = c.pat.get("args") or ["policy"]
     if not check:
         return []
     out: list[dict] = []
@@ -219,8 +292,23 @@ def _detect_iam_json_policy_analysis(c: InFileCtx) -> list[dict]:
         btype, bname = blk["groups"]
         if btype not in resource_types:
             continue
+        attrs = blk.get("attrs")
+        if attrs is not None:
+            if any(
+                st.matches(check)
+                for doc in argument_policies(attrs, args)
+                for st in json_statements(doc)
+            ):
+                out.append({
+                    "id": c.eid,
+                    "file": str(c.file_path),
+                    "line": blk["start_line"],
+                    "resource": f"{btype}.{bname}",
+                })
+            continue
         body = blk["body"]
-        pm = re.search(r'(?m)^\s*policy\s*=\s*jsonencode\(', body)
+        arg_re = "|".join(re.escape(a) for a in args)
+        pm = re.search(rf'(?m)^\s*(?:{arg_re})\s*=\s*jsonencode\(', body)
         if not pm:
             continue
         end_after = brace_walk(body, pm.end() - 1, opens="(", closes=")")
@@ -231,123 +319,160 @@ def _detect_iam_json_policy_analysis(c: InFileCtx) -> list[dict]:
         parsed = _hcl_object_to_json(raw)
         if parsed is None:
             continue
-        statements = parsed.get("Statement") or []
-        if isinstance(statements, dict):
-            statements = [statements]
-        for stmt in statements:
-            if not isinstance(stmt, dict):
-                continue
-            eff = str(stmt.get("Effect", "Allow")).lower()
-            if eff == "deny":
-                continue
-            actions = stmt.get("Action") or []
-            resources_l = stmt.get("Resource") or []
-            not_actions = stmt.get("NotAction") or []
-            not_resources = stmt.get("NotResource") or []
-            if isinstance(actions, str):
-                actions = [actions]
-            if isinstance(resources_l, str):
-                resources_l = [resources_l]
-            principal = stmt.get("Principal") or {}
-            has_public_principal = False
-            if principal == "*":
-                has_public_principal = True
-            elif isinstance(principal, dict):
-                for v in principal.values():
-                    if v == "*" or (isinstance(v, list) and "*" in v):
-                        has_public_principal = True
-                        break
-            has_wild_action = "*" in actions
-            has_wild_resource = "*" in resources_l
-            has_iam_wild = any(
-                isinstance(a, str) and a.startswith("iam:") and "*" in a
-                for a in actions
-            )
-            triggered = False
-            if check == "wildcard_action" and has_wild_action:
-                triggered = True
-            elif check == "wildcard_resource" and has_wild_resource:
-                triggered = True
-            elif check == "public_principal" and has_public_principal:
-                triggered = True
-            elif check == "wildcard_action_iam" and has_iam_wild:
-                triggered = True
-            elif (check == "wildcard_action_and_resource"
-                  and has_wild_action and has_wild_resource):
-                triggered = True
-            elif check == "not_action_or_not_resource" and (
-                not_actions or not_resources
-            ):
-                triggered = True
-            if triggered:
-                out.append({
-                    "id": c.eid,
-                    "file": str(c.file_path),
-                    "line": blk["start_line"],
-                    "resource": f"{btype}.{bname}",
-                })
-                break  # one finding per resource is enough
-    return out
-
-
-@_register_infile("firewall_open_port")
-def _detect_firewall_open_port(c: InFileCtx) -> list[dict]:
-    """``firewall_open_port`` — ``google_compute_firewall`` with
-    ``source_ranges`` containing 0.0.0.0/0 AND an ``allow {}`` block
-    whose ``ports`` list contains the configured port. Detects the
-    classic "world-open SSH/RDP/SQL" pattern. Supports port ranges
-    like ``"22-22"`` via numeric containment.
-    """
-    ports = c.pat.get("ports") or []
-    if not ports:
-        return []
-    want_ports = {str(p) for p in ports}
-    out: list[dict] = []
-    for blk in c.resources:
-        btype, bname = blk["groups"]
-        if btype != "google_compute_firewall":
-            continue
-        body = blk["body"]
-        if "0.0.0.0/0" not in body:
-            continue
-        matched = False
-        for am in re.finditer(r'(?m)^\s*allow\s*\{', body):
-            a_end_after = brace_walk(body, am.end() - 1)
-            if a_end_after is None:
-                continue
-            a_end = a_end_after - 1
-            allow_body = body[am.end():a_end]
-            port_match = re.search(r'ports\s*=\s*\[([^\]]+)\]', allow_body)
-            if not port_match:
-                continue
-            listed = re.findall(r'"([^"]+)"', port_match.group(1))
-            for p in listed:
-                if p in want_ports:
-                    matched = True
-                    break
-                if "-" in p:
-                    try:
-                        lo, hi = (int(x) for x in p.split("-", 1))
-                    except ValueError:
-                        continue
-                    for wp in want_ports:
-                        try:
-                            wpi = int(wp)
-                        except ValueError:
-                            continue
-                        if lo <= wpi <= hi:
-                            matched = True
-                            break
-                if matched:
-                    break
-            if matched:
-                break
-        if matched:
+        if any(st.matches(check) for st in json_statements(parsed)):
             out.append({
                 "id": c.eid,
                 "file": str(c.file_path),
                 "line": blk["start_line"],
                 "resource": f"{btype}.{bname}",
+            })
+    return out
+
+
+@_register_infile("firewall_open_port")
+def _detect_firewall_open_port(c: InFileCtx) -> list[dict]:
+    """``firewall_open_port`` — an inbound allow rule open to the whole
+    internet (``0.0.0.0/0`` / ``::/0``; for Azure also ``*`` /
+    ``Internet``), on any of ``ports`` if given, else on any port.
+
+    ``resource`` picks the type (default ``google_compute_firewall``, for
+    the original GCP rules); see `_network` for the supported types and
+    how each is reduced to inbound rules — egress, deny and outbound rules
+    never match. Port ranges (``"1000-2000"``, ``from_port``/``to_port``)
+    match by containment, and ``var.X`` / ``local.X`` sources are resolved
+    against variable defaults. The finding carries the open ranges under
+    ``_open_port_ranges`` for the structured ``escalation`` pass in
+    `detect_in_file`, which removes it.
+    """
+    rt = c.pat.get("resource", "google_compute_firewall")
+    want = [int(p) for p in (c.pat.get("ports") or [])]
+    out: list[dict] = []
+    for blk in c.resources:
+        btype, bname = blk["groups"]
+        if btype != rt:
+            continue
+        # Skips only a literal `count = 0` (a count from a variable default
+        # can be overridden by tfvars at apply time).
+        if _resource_is_count_zero(blk["body"], c.var_defaults):
+            continue
+        open_rules = world_open_rules(rt, view_for(blk), c.var_defaults)
+        if want:
+            open_rules = [r for r in open_rules if any(r.covers(p) for p in want)]
+        if open_rules:
+            out.append({
+                "id": c.eid,
+                "file": str(c.file_path),
+                "line": blk["start_line"],
+                "resource": f"{btype}.{bname}",
+                "_open_port_ranges": [r.ports for r in open_rules],
+            })
+    return out
+
+
+# ---- high-entropy secret detection -------------------------------------
+
+# Token charset: base64 (standard + url-safe) and hex. Real hex strings
+# (16 symbols → H tops out ≈3.7) sit *below* the default 4.0 threshold, so
+# git SHAs / image digests fall out naturally while genuine base64 tokens
+# (62+ symbols, H≈4.1–4.6) clear it — entropy itself does the separation.
+_ENTROPY_TOKEN_RE = re.compile(r"^[A-Za-z0-9+/=_-]+$")
+
+# `name = "value"` single-line literal assignments. Interpolations and
+# references are filtered out by inspecting the captured value below.
+_ENTROPY_ASSIGN_RE = re.compile(r'(?m)([A-Za-z_][\w-]*)\s*=\s*"([^"\n]*)"')
+
+# Cloud resource-id prefixes: structured, base64-charset, occasionally
+# H>4.0 (e.g. `ami-0abcdef1234567890`) but never secrets.
+_ENTROPY_ID_PREFIXES = (
+    "ami-", "vol-", "vpc-", "subnet-", "sg-", "snap-", "rtb-", "acl-",
+    "eni-", "igw-", "nat-", "i-", "eipalloc-", "pl-", "fsg-", "tgw-",
+)
+
+
+def _shannon_entropy(s: str) -> float:
+    """Shannon entropy of ``s`` in bits/character (0.0 for empty)."""
+    if not s:
+        return 0.0
+    n = len(s)
+    counts: dict[str, int] = {}
+    for ch in s:
+        counts[ch] = counts.get(ch, 0) + 1
+    return -sum((c / n) * math.log2(c / n) for c in counts.values())
+
+
+def _is_high_entropy_secret(value: str, *, min_len: int, max_len: int,
+                            min_entropy: float) -> bool:
+    """True when ``value`` looks like a hardcoded high-entropy token.
+
+    Charset-gated (base64/token) + length-bounded + entropy-thresholded,
+    excluding interpolations/references and cloud resource-ids. The
+    charset+entropy combination lets hex strings (git SHAs, image digests,
+    H≈3.7) fall out below a base64 token (H≈4.1+), so v1 needs no separate
+    hex handling — and avoids the git-SHA false-positive class.
+    """
+    if not (min_len <= len(value) <= max_len):
+        return False
+    if "${" in value or "$(" in value:          # interpolation / shell
+        return False
+    if not _ENTROPY_TOKEN_RE.match(value):       # not token charset
+        return False
+    low = value.lower()
+    if any(low.startswith(p) for p in _ENTROPY_ID_PREFIXES):
+        return False
+    # Readable kebab/snake-case names (bucket names, resource names) can clear
+    # the entropy bar by length while using a single character class; genuine
+    # tokens mix at least two of {lowercase, uppercase, digit}. This filters the
+    # common `my-app-prod-logs-bucket-name`-style false positive.
+    classes = (any(c.islower() for c in value)
+               + any(c.isupper() for c in value)
+               + any(c.isdigit() for c in value))
+    if classes < 2:
+        return False
+    return _shannon_entropy(value) >= min_entropy
+
+
+@_register_infile("high_entropy_string")
+def _detect_high_entropy_string(c: InFileCtx) -> list[dict]:
+    """``high_entropy_string`` — flag string literals whose Shannon entropy
+    marks them as probable hardcoded secrets (API tokens, access keys),
+    *regardless of the argument name*. Complements the name/prefix-based
+    ``grep`` secret rules, which miss tokens in oddly-named fields.
+
+    Catalogue pattern fields (all optional, with defaults):
+      ``min_length`` (20), ``max_length`` (100), ``min_entropy`` (4.0).
+    Comments are stripped first (length-preserving, so line numbers stay
+    accurate); interpolations/references, cloud resource-ids, and
+    hex/git-SHA-class strings are excluded (see _is_high_entropy_secret).
+    """
+    min_len = int(c.pat.get("min_length", 20))
+    max_len = int(c.pat.get("max_length", 100))
+    min_entropy = float(c.pat.get("min_entropy", 4.0))
+    out: list[dict] = []
+    for blk in c.resources:
+        btype, bname = blk["groups"]
+        body = strip_hcl_context(blk["body"])   # blank comments, keep offsets
+        seen: set[tuple[str, str]] = set()
+        for m in _ENTROPY_ASSIGN_RE.finditer(body):
+            arg, value = m.group(1), m.group(2)
+            if (arg, value) in seen:
+                continue
+            if not _is_high_entropy_secret(
+                value, min_len=min_len, max_len=max_len, min_entropy=min_entropy
+            ):
+                continue
+            seen.add((arg, value))
+            line = blk["start_line"] + body.count("\n", 0, m.start())
+            ent = _shannon_entropy(value)
+            out.append({
+                "id": c.eid,
+                "file": str(c.file_path),
+                "line": line,
+                "resource": f"{btype}.{bname}",
+                "context": (
+                    f"high-entropy string assigned to `{arg}` "
+                    f"(entropy {ent:.2f} bits/char, length {len(value)}) "
+                    f"— probable hardcoded secret"
+                ),
             })
     return out
 

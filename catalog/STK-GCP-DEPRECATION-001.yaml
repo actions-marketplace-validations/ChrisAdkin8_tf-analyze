@@ -3,7 +3,12 @@ title: "Resource uses deprecated argument"
 section: robustness
 default_urgency: MEDIUM
 blast_radius: single-resource
-status: active
+# Retired: none of its arguments is deprecated in the google provider
+# (checked against the provider docs, 2026-10-27). enable_legacy_abac,
+# logging_service, monitoring_service, metadata_startup_script and
+# google_compute_address.address are all current, and the `.*` patterns
+# also fired on the secure `enable_legacy_abac = false`.
+status: deprecated
 mitre:
   - "T1195.002"
 cwe:
@@ -41,6 +46,8 @@ patterns:
     regex: ".*"
     description: metadata_startup_script is deprecated; use metadata.startup-script instead
   - kind: grep
+    text_scan: "Terraform structure outside resource attributes (module source, version constraints, lifecycle, data / provisioner blocks) - no structured kind for it yet"
+    code_only: true  # ignore comments and heredoc text
     file_glob: "**/*.tf"
     regex: 'resource\s+"google_compute_address".*\n.*\baddress\b'
     description: google_compute_address.address argument renamed in v6

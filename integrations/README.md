@@ -53,7 +53,7 @@ Full CI integration with SARIF upload to Code Scanning, an engine-rendered PR su
 
 - `security-events: write` permission (already in the workflow).
 - Public repo OR Advanced Security enabled (for Code Scanning uploads).
-- Python 3.12 on the runner (stdlib only — no pip install needed).
+- Python 3.12 on the runner (no pip install needed — the HCL parser is vendored).
 
 ## Verify-fixed workflow
 
@@ -79,7 +79,7 @@ A small FastAPI app under [`badge-service/`](badge-service/) that returns embedd
 | `GET /score/<owner>/<repo>.svg` | Badge for the `main` branch — `tf-analyze: 82 (B)` shields.io-shape SVG, coloured by grade. |
 | `GET /score/<owner>/<repo>/<branch>.svg` | Branch-specific badge. Branches with `/` in the name (`release/v1.0`, `feat/foo`) round-trip cleanly. |
 | `GET /health` | Liveness check for Fly.io. |
-| `POST /ingest` | Upload a scan result. HMAC-SHA256-signed body authenticated against `TFA_BADGE_INGEST_SECRET`. Body is `{owner, repo, branch, scan: <detect.py --format json output>}`. |
+| `POST /ingest` | Upload a scan result. Body is `{owner, repo, branch, scan: <detect.py --format json output>}`, at most 8 MiB. `X-TFA-Signature: sha256=<hex>` is the HMAC-SHA256 of `<X-TFA-Timestamp>.<body>` under **that repo's** key (derived from `TFA_BADGE_INGEST_SECRET`), so one repo's key cannot write another's badge; a timestamp more than 5 minutes off, or not newer than the repo's last upload (a replay), is refused. |
 
 **Embed in any README:**
 
@@ -87,10 +87,14 @@ A small FastAPI app under [`badge-service/`](badge-service/) that returns embedd
 ![tf-analyze](https://tf-analyze-badge.fly.dev/score/owner/repo.svg)
 ```
 
-**Wire into CI** with the bundled `scripts/upload-score.sh` — POSTs the engine's JSON output to `/ingest` after every push to main:
+**Wire into CI** with the bundled `scripts/upload-score.sh` — POSTs the engine's JSON output to `/ingest` after every push to main. The operator first derives the repo's upload key (the master secret stays with the operator) and stores it as a CI secret:
 
 ```sh
-TFA_BADGE_INGEST_SECRET=$BADGE_SECRET \
+# operator, once per repo:
+TFA_BADGE_INGEST_SECRET=$MASTER ./integrations/badge-service/scripts/derive-key.sh ChrisAdkin8 tf-analyze
+
+# CI, after each push to main:
+TFA_BADGE_INGEST_KEY=$BADGE_KEY \
 TFA_BADGE_URL=https://tf-analyze-badge.fly.dev \
   ./integrations/badge-service/scripts/upload-score.sh \
   ChrisAdkin8 tf-analyze main scan.json
@@ -187,7 +191,7 @@ Pre-apply gate that scans Terraform Cloud / HCP Terraform plans before they run.
 
 ## Other CI systems
 
-The core invocation is just a single `python3` call with stdlib-only dependencies, so adapting to GitLab CI, CircleCI, Buildkite, etc. is trivial:
+The core invocation is just a single `python3` call with no `pip install` step (the engine vendors its HCL parser), so adapting to GitLab CI, CircleCI, Buildkite, etc. is trivial:
 
 ```bash
 python3 scripts/detect.py --target . --mode diff --format sarif --fail-on HIGH

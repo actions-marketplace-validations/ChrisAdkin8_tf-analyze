@@ -45,7 +45,7 @@ scripts/stub-status.py --age 90d              # find stubs older than 90 days
 5. [Urgency Levels](#urgency-levels)
 6. [Blast Radius](#blast-radius)
 7. [Suppression](#suppression)
-8. [CI Integration](#ci-integration) — SARIF, HTML, `--compare`, `--fail-on`, optional python-hcl2
+8. [CI Integration](#ci-integration) — SARIF, HTML, `--compare`, `--fail-on`, the vendored HCL parser
 9. **Step 0** — Pre-Analysis: credential scan + hygiene
 10. **Step 1** — Discovery (file enumeration, dependency graph, sentinel tempdir)
 11. **Step 2** — Security Posture
@@ -107,19 +107,19 @@ The skill has five execution modes. Pick the right one before starting — they 
 
 ## Cloud scope
 
-The skill is **GCP-first**. Catalogue entries, CIS mappings, the IAM compatibility matrix (Appendix A), and stack-specific Step 10 checks are exhaustive for Google Cloud. AWS and Azure are **secondary**: the skill will surface obvious findings (public S3 buckets, hardcoded credentials, missing tags) but does NOT claim CIS coverage or full provider parity for those clouds. If the codebase is AWS- or Azure-dominant, expect lower recall and treat the report as a starting point rather than an audit.
+AWS, GCP, and Azure are at **rule-count parity (91 rules each)** — IAM, storage, compute, networking, KMS/encryption, and managed data services — each carrying CIS and multi-framework compliance tags. GCP retains the most complete CIS Foundations Benchmark mapping and the IAM compatibility matrix (Appendix A); AWS and Azure cover the high-value controls but don't claim line-by-line benchmark completeness. Kubernetes/Helm coverage is lighter (18 rules). As with any static analyzer, treat the report as a high-signal starting point, not a substitute for a manual audit.
 
 **Per-cloud rule counts (regenerate via `python3 scripts/detect.py --list-rules | wc -l`):**
 
 | Cloud | Cloud-specific rules | Notes |
 |---|---|---|
-| **AWS** | 86 | IAM wildcard / `iam_json_policy_analysis` / role privesc, S3 (public access block / server access logging / SSE / versioning), RDS & Aurora (encryption / deletion-protection / backup retention / EOL engine / PITR), KMS, CloudTrail, SQS / SNS / ElastiCache / Redshift / DynamoDB, ECR (scan-on-push / lifecycle), VPC flow logs, EKS (private endpoint / logging / secrets / IRSA), launch-template IMDSv2, GuardDuty, Route53 DNSSEC, SG world-open ports, CloudFront (allow-all / missing logging), Cognito MFA, Secrets Manager rotation, API Gateway access logs, Lambda DLQ / X-Ray, ECS container insights, Module Reuse Advisor (`MOD-REUSE-AWS-VPC-001`). |
-| **GCP** | 43 | IAM, KMS, GKE, CloudSQL, BigQuery, Cloud Run, Pub/Sub, GCS, networking (SSH/RDP/database port world-open), Shielded VM, Audit Logs, service-account key creation, Cloud Memorystore Redis auth/TLS, Artifact Registry CMEK, Module Reuse Advisor (`MOD-REUSE-GCP-NETWORK-001`). Full CIS GCP Foundations Benchmark v4.0 coverage for documented controls. |
-| **Azure** | 34 | RBAC, storage (versioning/HTTPS), Key Vault (network ACL/key rotation), AKS (Workload Identity / private / authorized IPs / network policy), SQL (firewall/TDE/deprecated single-server/SSL), App Service HTTPS, NSG flow logs, UAMI, ACR admin, subscription activity log, Linux VM password authentication, Module Reuse Advisor (`MOD-REUSE-AZURE-AKS-001`). |
-| **Kubernetes / Helm** | 5 | Helm release `set { }` overrides (`SEC-K8S-HELM-001`, `-002`); `kubernetes_*` resource hardening. |
-| **Multi-cloud** | 47 | Secrets in HCL/tfvars, provisioner usage, module pinning / supply-chain refs / staleness, `required_providers` version pinning, lifecycle controls (`ROB-DRIFT-001`, `-002`), `count`/`for_each` anti-patterns including `ROB-FOREACH-002` keyset stability, orphan modules (`MOD-UNUSED-001`), variable validation, sensitive outputs, provider aliases, backends, Vault data sources, `applies_when` provider-version gating. |
+| **AWS** | 91 | IAM wildcard / `iam_json_policy_analysis` / role privesc, S3 (public access block / server access logging / SSE / versioning), RDS & Aurora (encryption / deletion-protection / backup retention / EOL engine / PITR), KMS, CloudTrail, SQS / SNS / ElastiCache / Redshift / DynamoDB, ECR (scan-on-push / lifecycle), VPC flow logs, EKS (private endpoint / logging / secrets / IRSA), launch-template IMDSv2, GuardDuty, Route53 DNSSEC, SG world-open ports, CloudFront (allow-all / missing logging), Cognito MFA, Secrets Manager rotation, API Gateway access logs, Lambda DLQ / X-Ray, ECS container insights, Module Reuse Advisor (`MOD-REUSE-AWS-VPC-001`). |
+| **GCP** | 91 | IAM, KMS, GKE, CloudSQL, BigQuery, Cloud Run, Pub/Sub, GCS, networking (SSH/RDP/database port world-open), Shielded VM, Audit Logs, service-account key creation, Cloud Memorystore Redis auth/TLS, Artifact Registry CMEK, Module Reuse Advisor (`MOD-REUSE-GCP-NETWORK-001`). Full CIS GCP Foundations Benchmark v4.0 coverage for documented controls. |
+| **Azure** | 91 | RBAC, storage (versioning/HTTPS), Key Vault (network ACL/key rotation), AKS (Workload Identity / private / authorized IPs / network policy), SQL (firewall/TDE/deprecated single-server/SSL), App Service HTTPS, NSG flow logs, UAMI, ACR admin, subscription activity log, Linux VM password authentication, Module Reuse Advisor (`MOD-REUSE-AZURE-AKS-001`). |
+| **Kubernetes / Helm** | 18 | Helm release `set { }` overrides (`SEC-K8S-HELM-001`, `-002`); `kubernetes_*` resource hardening (PSA, network policy, cluster-admin RoleBindings). |
+| **Cross-cloud / engine** | 63 | Secrets in HCL/tfvars, provisioner usage, module pinning / supply-chain refs / staleness, `required_providers` version pinning, lifecycle controls (`ROB-DRIFT-001`, `-002`), `count`/`for_each` anti-patterns including `ROB-FOREACH-002` keyset stability, orphan modules (`MOD-UNUSED-001`), variable validation, sensitive outputs, provider aliases, backends, Vault data sources, `applies_when` provider-version gating. |
 
-Cloud-specific counts exclude multi-cloud rules. **Total: 217 active rules.** Re-run `python3 scripts/detect.py --list-rules` for the full live enumeration.
+AWS 91, GCP 90, Azure 91. **Total: 353 active catalogue rules** (plus 2 stubs; `--list-rules` reports the active ones). Re-run `python3 scripts/detect.py --list-rules` for the full live enumeration. README.md's "Rules at a glance" table is the maintained per-cloud breakdown.
 
 When a finding fires against an AWS or Azure resource and the catalogue doesn't have a stable ID for it, tag it as **EXPLORATORY** (per the architecture section below) — not as a regression in the next run.
 
@@ -212,7 +212,7 @@ Every finding MUST also be tagged with blast radius:
 
 ## Suppression
 
-Suppressions are applied at **both** the detection pass (via `detect.py --suppress`) and the judgement pass. The detection pass handles two suppression sources:
+Suppressions are applied at **both** the detection pass (`detect.py` applies them by default; `--no-suppress` turns them off) and the judgement pass. The detection pass handles two suppression sources:
 
 **Inline comments:** `# tf-analyze:ignore <CATALOGUE-ID>` on the same line or the line above a finding suppresses it for that specific location.
 
@@ -249,41 +249,38 @@ The detection pass supports CI gating via exit codes and multiple output formats
 - **`--compliance-framework [cis|pci_dss|soc2|owasp_iac|nist_csf|nist_800_53|csa_ccm|slsa|owasp_top10|owasp_api|owasp_cicd|owasp_llm|owasp_k8s|owasp_asvs|all]`** — choose the compliance standard for `--compliance` output. Default: `cis`. **All 13 modes surface real data** after the R30.9 bulk taxonomy tag (174 rules carry the four new R30.1 fields). Use `all` to combine every framework in one report.
 - **`--rank-by [urgency|exploitability|hybrid]`** *(new in R30.2)* — ordering mode for findings. `urgency` (default) keeps the legacy CRITICAL-first ordering. `exploitability` cross-references each rule's `cwe:` tags against CISA's Known Exploited Vulnerabilities catalog, promotes findings whose rule touches a KEV-listed CWE class one urgency tier (LOW→MEDIUM→HIGH→CRITICAL, capped), and sorts KEV hits first. `hybrid` keeps urgency-first ordering with the KEV promotion applied. KEV + FIRST.org EPSS feeds are cached daily at `~/.cache/tf-analyze/` (override with `$TFA_CACHE_DIR`; freshness window via `$TFA_THREAT_INTEL_TTL`). 🔥 KEV badge appears in text output, PR-summary table cell, and SARIF (`exploitability:kev` tag per result). **No comparable OSS IaC scanner integrates KEV today.**
 - **`--no-threat-intel`** *(new in R30.2)* — disable network fetches for CISA KEV / FIRST.org EPSS. Falls back to cache if present, otherwise skips KEV/EPSS enrichment cleanly. Required for air-gapped CI.
-- **`--explain-score`** *(new in R30.8)* — surface the top-5 findings ranked by score contribution (CRITICAL=15 pts > HIGH=7 > MEDIUM=3 > LOW=1; INFO weight 0 is excluded), with the projected score and grade after each fix is applied. Tells the user **which fix is worth most**. Renders as a header block in text output and a structured `score_explanation` field in JSON output.
+- **`--explain-score`** *(new in R30.8)* — surface the top-5 findings ranked by score contribution (CRITICAL=15 pts > HIGH=7 > MEDIUM=3 > LOW=1; INFO weight 0 is excluded), with the points each fix is actually worth (`points`; MEDIUM / LOW are divided by the size factor) and the projected score and grade after each fix is applied. Tells the user **which fix is worth most**. Renders as a header block in text output and a structured `score_explanation` field in JSON output.
 - **`--show-fixes`** — render `fix_hcl` snippets from catalogue entries alongside each finding. HTML: dark-themed disclosure widget per finding. Text: indented HCL block below the finding line. In `--mode pr-review`, fix snippets are posted as ` ```suggestion ``` ` blocks — reviewers can apply with one click.
 - **`--apply-fixes dry-run`** — preview auto-remediation as a unified diff without writing files. Run this first to review what would change. Safe in CI (read-only).
 - **`--apply-fixes apply`** — apply `fix_hcl` patches directly to `.tf` files. Creates `.bak` backups. Handles `resource_missing_arg` (inserts missing attribute before closing `}`) and `resource_arg`/`hcl_attr` (replaces wrong-value line). After applying, re-run `detect.py` to confirm the findings are resolved.
 - **`--cache`** — enable incremental scan caching. Writes `.tf-analyze-cache.json` in the target directory keyed on a hash of all `.tf` file contents and catalogue rules. Subsequent runs on unchanged code return cached findings instantly. Use `--cache-file PATH` to override the location. Invalidated automatically when any file or rule changes.
-- **`--baseline PATH`** *(new in Round 24)* — load a prior JSON report and suppress findings whose `(id, file, line, resource)` tuple is already present. Only retained findings affect the `--fail-on` exit code; suppressed-by-baseline findings are surfaced under the JSON `suppressed_by_baseline` key. Use to ratchet on legacy repos: snapshot once, gate on no-regressions thereafter.
+- **`--baseline PATH`** *(new in Round 24)* — load a prior JSON report and suppress findings already present in it — matched by rule, target-relative file and resource, not the line, so moved code or a different checkout folder still matches. Only retained findings affect the `--fail-on` exit code; suppressed-by-baseline findings are surfaced under the JSON `suppressed_by_baseline` key. Use to ratchet on legacy repos: snapshot once, gate on no-regressions thereafter.
 - **`--format mitre`** *(updated in the 2026-05-10 sweep)* — group findings by **ATT&CK tactic → technique** using catalogue `mitre:` fields. Output uses the canonical kill-chain order (Initial Access → Execution → ... → Impact); each technique is rendered with its human name (`T1078.004 — Valid Accounts: Cloud Accounts`), not just the bare ID. Pinned against ATT&CK v17 via `MITRE_ATTACK_VERSION` in `detect.py`. Findings without a mapping fall into a final `(unmapped)` group so coverage gaps stay visible. SARIF output additionally tags every finding with `cis:`, `mitre:Tnnnn`, `cwe:CWE-<n>`, and `d3fend:D3-<TOKEN>` properties — GitHub Code Scanning consumers can filter by any of the four taxonomies.
 - **`--mitre-tactic <tactic>`** *(new in the 2026-05-10 sweep)* — restrict `--format mitre` output to one ATT&CK tactic. Case-insensitive, separator-tolerant (`initial-access`, `Initial Access`, and `INITIAL_ACCESS` are all equivalent). Powers tactic-scoped audits ("show me only the Defense Evasion findings on this branch").
-- **`--no-hcl2`** *(new in Round 24)* — disable the python-hcl2 fast-path (which is now ON by default when the dependency is installed). Use for benchmarking or in stdlib-only environments. Equivalent env var: `TF_ANALYZE_NO_HCL2=1`. The legacy `--use-hcl2` flag still works but is now a no-op.
+- **`--no-hcl2` / `--use-hcl2`** *(deprecated)* — no-ops kept for one minor release; each prints a deprecation notice. The vendored HCL parser is always used. The env vars `TF_ANALYZE_NO_HCL2` / `TF_ANALYZE_USE_HCL2` are likewise ignored with a notice.
 - **`--show-info`** *(new with module-reuse advisor)* — render INFO-tier findings (advisory; e.g. module-reuse suggestions). Default off — INFO findings are still counted in `summary.counts.INFO` but are filtered out of the rendered output so they don't drown the signal. INFO carries weight 0 in the score formula, so this flag only affects display, not gating.
 
 Ready-to-use configs for pre-commit and GitHub Actions live under `integrations/`. The GitHub Actions workflow (`integrations/github-action.yml`) now includes a PR comment fallback that posts findings as a collapsible comment on every pull request — works on free-tier repos that don't have Code Scanning enabled.
 
-### `python-hcl2` fast-path (default-on since Round 24)
+### Vendored HCL parser (python-hcl2)
 
-By default `detect.py` enables the python-hcl2 fast-path when the
-dependency is installed (the Docker image bundles it). When it isn't,
-the regex parser is used and a one-line stderr notice is emitted. A
-known limitation of the regex parser is that heredoc-bearing attributes
-(`user_data = <<-EOF\n...\nEOF`) return `None` from `block_arg_value`,
-so any check looking at the value of such an attribute silently misses.
+The engine ships its own copy of
+[`python-hcl2`](https://pypi.org/project/python-hcl2/) and its only
+dependency, `lark`, in `scripts/_vendor/` (pinned versions in
+`scripts/_vendor/VERSIONS`). `scripts/_hcl.py` always loads this copy, ahead
+of any installed `hcl2`, so every surface — this skill, the CLI, the
+Docker images, the VS Code extension, the pip wheel — runs the same
+parser with **no `pip install` step**. Refresh it only with
+`python3 scripts/vendor_deps.py`, which checks each wheel's sha256.
 
-Pass `--use-hcl2` (or set `TF_ANALYZE_USE_HCL2=1`) to enable an optional
-fast-path that uses [`python-hcl2`](https://pypi.org/project/python-hcl2/)
-for heredoc-aware extraction. If `python-hcl2` isn't installed, the flag
-prints a one-line warning and the regex path is used unchanged — so the
-default behaviour is preserved and the flag is safe to set globally in
-CI. Install with `pip install python-hcl2` once on the runner; the
-performance overhead is negligible because it only kicks in for blocks
-that contain `<<` (the regex path stays the default for everything else).
+Today the parser is used for heredoc-aware attribute extraction
+(`block_arg_value` on bodies containing `<<`); the regex scanner handles
+everything else. Moving rule evaluation onto the parse tree is planned in
+`tasks/hcl-parser-migration.md`.
 
-This is the extension point for richer hcl2-backed detectors. Add new
-checks under the existing `pattern_kind` system; call
-`_hcl2_block_arg_value` (or load the parse tree directly via
-`hcl2.load`) when the check needs structural awareness regex can't give.
+lark caches the built grammar next to the vendored `parser.py` (gitignored;
+pre-built in the Docker images and `.vsix`). The first run in a fresh
+checkout builds it once (~0.4s).
 
 ---
 
@@ -499,7 +496,7 @@ Examine every `.tf` file in scope for:
 
 ### 2b. IAM and access control
 - Overly broad IAM roles (`roles/owner`, `roles/editor`, `roles/admin`, `*Admin`) → **SEC-GCP-IAM-001** | CIS 1.6
-- `allUsers` or `allAuthenticatedUsers` in any IAM binding → **SEC-GCP-IAM-002** | CIS 5.1, 7.1
+- `allUsers` or `allAuthenticatedUsers` in a project / dataset IAM binding → **SEC-GCP-IAM-002**; on a Cloud Storage bucket → **SEC-GCP-STORAGE-IAM-001** | CIS 5.1, 7.1
 - IAM bindings at project level that should be at resource level (consult Appendix A first)
 - Service accounts with more permissions than their usage requires
 - Missing `condition` blocks on IAM bindings where appropriate
@@ -1236,13 +1233,14 @@ Include the delta in the report header after the executive summary.
 
 The score and letter grade are **emitted by `detect.py` directly** as part of every `--format json`, `--format text`, and `--format html` output. The agent should quote the engine's number, never recompute it.
 
-Single source of truth: `_RISK_WEIGHTS` and `_GRADE_TIERS` in `scripts/detect.py`. The current weights are:
+Single source of truth: `_RISK_WEIGHTS`, `_GRADE_TIERS` and `_size_factor` in `scripts/_scoring.py` (scoring version 2). The formula:
 
 ```text
-score = max(0, 100 - (15 * CRITICAL + 7 * HIGH + 3 * MEDIUM + 1 * LOW))
+size_factor = max(1, sqrt(resources_scanned / 20))
+score = max(0, floor(100 - (15 * CRITICAL + 7 * HIGH + (3 * MEDIUM + 1 * LOW) / size_factor)))
 ```
 
-INFO findings do not affect the score (weight 0). Suppressed findings (both `# tf-analyze:ignore` / `.tf-analyze-ignore.yaml` and `--baseline` matches) count at half weight — they have been acknowledged but the underlying risk still exists. The grade tiers:
+CRITICAL and HIGH cost the same in any repository (each is a concrete exposure); MEDIUM and LOW are hygiene, judged relative to size — up to 20 resources the factor is 1 (identical to version 1), so the worked examples below hold for small modules. `resources_scanned` counts only resources of a type at least one rule checks, so `terraform_data` / `null_resource` / `random_*` padding cannot raise the score. Hygiene is mess per assessed resource: adding a real resource cleaner than average, or deleting one dirtier than average, can move the score a point the "wrong" way, but fixing a finding always helps. The summary block reports `resources_scanned`, `size_factor` and `penalty`. INFO findings do not affect the score (weight 0). Suppressed findings (both `# tf-analyze:ignore` / `.tf-analyze-ignore.yaml` and `--baseline` matches) count at half weight — they have been acknowledged but the underlying risk still exists. The grade tiers:
 
 | Grade | Score range |
 |-------|-------------|
@@ -1905,7 +1903,7 @@ Refer operators to `infracost` or the official cloud pricing calculator for proc
 
 Items that would extend `detect.py` beyond its current regex-first scope. None of these are wired — tracked here so future contributors don't re-discover the design space:
 
-- **Structured HCL parsing.** Swap the regex scanner for `python-hcl2` as an optional dependency. Would improve recall on dynamic blocks, interpolation-inside-strings, and multi-line attribute values. The regex path stays as fallback so the skill remains stdlib-only by default.
+- **Structured HCL parsing.** Move rule evaluation from the regex scanner onto the vendored `python-hcl2` parse tree. Would improve recall on dynamic blocks, interpolation-inside-strings, and multi-line attribute values. In progress: see `tasks/hcl-parser-migration.md`.
 - **External reconciler.** Read `tflint` / `tfsec` / `trivy` JSON output and cross-reference with catalogue IDs. Novel IDs become `--propose-stub` input; duplicates are collapsed by file+line fingerprint. Reduces double-reporting when teams run both this skill and a dedicated scanner.
 - **Plan-time checks.** `mode:plan` already exists but is thinly implemented. Expand to parse `terraform show -json <plan>` for drift, destroy-on-create, and sensitive-attribute exposure that only manifest at plan time.
 - **`TF_BINARY` env var** for pointing at `tofu` or a specific `terraform` build in hermetic environments. Currently the skill invokes `terraform` by name.

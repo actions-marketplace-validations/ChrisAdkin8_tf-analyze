@@ -64,8 +64,14 @@ verification: |              # required, multiline. how to verify the fix landed
   is created. Re-run tf-analyze in mode:verify-fixed.
 related: []                  # optional, list of related catalogue IDs
 escalation:                  # optional, conditions that bump urgency
-  - condition: "estimated_monthly_cost_usd > 1000"
-    new_urgency: HIGH
+  - condition: "estimated_monthly_cost_usd > 1000"   # free text: read by the
+    new_urgency: HIGH                                # skill's judgement pass only
+  - condition: "open on SSH / RDP"                   # human-readable label
+    match:                       # structured: evaluated by the engine
+      ports:                     # network rules: an open rule covers a port
+        - 22
+        - 3389
+    new_urgency: CRITICAL        # (`urgency:` is accepted too)
 fixtures:                    # optional, list of fixture directories that exercise this finding
   - iam_too_broad
 applies_when:                # optional, gate the rule on provider/Terraform version
@@ -73,6 +79,31 @@ applies_when:                # optional, gate the rule on provider/Terraform ver
     aws: "5.0"
   min_terraform: "1.10"      # rule fires only when terraform.required_version allows ≥ 1.10
 ```
+
+### `escalation` semantics
+
+Each `escalation:` item raises the finding's urgency when its condition
+holds (never lowers it). Two forms:
+
+- **Structured — `match:`** — evaluated by the engine on every finding
+  the rule produces. `ports: [22, 3389]` (network rules using
+  `firewall_open_port`) holds when an open inbound rule covers one of the
+  ports. Any other key is an attribute path of the finding's resource
+  (dotted, like `nested_path`) mapped to a regex; it holds when the value,
+  or any element of a list value, matches (after resolving `var.X` /
+  `local.X` to defaults). All keys must hold.
+- **Free text — `condition:` only** — read by the skill's judgement pass
+  (cost, environment, data sensitivity — things the engine can't know).
+  The engine ignores it.
+
+`condition:` may also accompany `match:` as a human-readable label. The
+target urgency is `new_urgency:` (or `urgency:`). An item with neither
+`match` nor `condition` is a catalogue error.
+
+Write lists in block style (`- 22` on its own line) and put `condition:`
+first in each item: the stdlib YAML loader keeps flow lists
+(`[22, 3389]`) as strings, and misreads a nested mapping that is the
+*first* key of a list item.
 
 ### `applies_when` semantics
 
@@ -115,16 +146,24 @@ Common D3FEND IDs the catalogue uses today (full list in `apply_mitre.py`):
 
 ## Pattern kinds
 
+**Kubernetes API versions.** A pattern on a `kubernetes_X` resource also
+covers `kubernetes_X_v1` (and the reverse): the loader adds the alias to
+the per-resource kinds below, and `resource_absent` accepts either version
+for both `resource` and `when_present` (`_catalog.kubernetes_type_aliases`).
+Write rules against one name only.
+
 Per-file kinds (run inside `detect_in_file`):
 
 | Kind | Meaning |
 |---|---|
-| `resource_arg` | A `resource` block whose argument matches a regex |
-| `resource_missing_arg` | A `resource` block of the named type that lacks the named argument. Supports an optional `suppress_if: { arg: X, equals: "val" }` field — the finding is suppressed when an alternative arg equals the specified value (e.g., SQS queue encrypted via `sqs_managed_sse_enabled = true` suppresses the `kms_master_key_id` missing check). |
+| `resource_arg` | A `resource` block whose argument matches a regex. Shares `suppress_if` with `resource_missing_arg`, plus `name_regex` / `name_not_regex` (also on `resource_missing_arg`): only resources whose label, `name` or `bucket` matches / does not match. Both also take `unless_repo_has: <type>`: skip the pattern when a resource of that type (not `enabled = false`) is anywhere in the scan — for account-level settings such as `aws_ebs_encryption_by_default`. |
+| `resource_missing_arg` | A `resource` block of the named type that lacks the named argument. Supports an optional `suppress_if: { arg: X, equals: "val" }` (or `regex: '...'` instead of `equals`; `arg` may be a dotted path such as `default_action.type`, read from the parse tree) field — the finding is suppressed when an alternative arg equals the value or matches the regex (e.g., SQS queue encrypted via `sqs_managed_sse_enabled = true` suppresses the `kms_master_key_id` missing check). |
+| `ip_range_span` | A resource whose IP range from `start_arg` to `end_arg` covers at least `min_addresses` addresses — firewall rules written as a start / end pair (`azurerm_mssql_firewall_rule` and friends). Non-literal ends are skipped. |
 | `resource_present` | Any `resource` block of the named type triggers the finding |
 | `data_source_present` | Any `data` block of the named type triggers the finding (e.g. `vault_kv_secret_v2`) |
 | `grep` | A regex against the raw file body — last resort, use sparingly |
 | `hcl_attr` | A specific HCL nested-block attribute path (e.g., `lifecycle.prevent_destroy`) |
+| `high_entropy_string` | A string literal whose Shannon entropy marks it as a probable hardcoded secret (token / access key), regardless of the argument name — complements the name-based `grep` secret rules. Optional fields: `min_length` (20), `max_length` (100), `min_entropy` (4.0). |
 | `moved_block_present` | TF 1.5+ `moved` block — flagged for cleanup once apply has run |
 | `removed_block_present` | TF 1.7+ `removed` block — flagged for cleanup once destroy has run |
 | `count_index_ref`, `count_bool_pattern`, `count_length_unguarded`, `count_foreach_mix` | `count`/`for_each` anti-patterns |
@@ -136,12 +175,13 @@ Corpus-level kinds (run inside `detect_corpus` once per scan):
 | Kind | Meaning |
 |---|---|
 | `resource_absent` | Fires when a resource type is **absent** from the scan target. Use `when_present: <type>` to guard against cross-cloud false positives (only fires when the prerequisite type exists). Use `scope: repo` for repo-wide absence checks. |
-| `backend_missing_arg` | Fires when a `terraform { backend "<type>" {} }` block is missing a required argument (e.g., S3 backend without `dynamodb_table`). Fields: `backend_type`, `arg`. |
+| `backend_missing_arg` | Fires when a `terraform { backend "<type>" {} }` block is missing a required argument (e.g., S3 backend without `dynamodb_table`). Fields: `backend_type`, `arg`, optional `alternatives` (regexes that also satisfy it, e.g. `use_lockfile = true`). Comments are ignored. |
 | `providers_version_missing` | Fires once per `required_providers` provider entry that has no `version` constraint. Used by `ROB-VERSION-003`. No extra fields needed — the kind scans all files. |
 | `output_sensitive_leak`, `cross_module`, `variable_unused`, `output_unused`, `module_missing_tests`, `backend_inconsistency`, `templatefile_sensitive_leak`, `remote_state_present`, `provider_alias_unused`, `provider_alias_module_mismatch`, `foreach_over_list`, `data_external_injection`, `tfstate_in_repo`, `submodule_version_missing`, `prod_no_deletion_protection`, `deprecated_datasource` | See in-source docstrings |
 | `foreach_keyset_unstable` | A `for_each` whose keyset is derived from another managed resource's attribute (splat `aws_subnet.x[*].id` or comprehension `[for s in aws_subnet.x : s.id]`). Re-keys on every upstream resource-set change → destroy/create on every existing instance. Leading identifier is checked against a deny-list of safe scopes (`var`, `local`, `data`, `module`, `each`, `count`) so input-driven keysets don't fire. |
 | `module_unused` | A directory that declares `variable {}` and/or `output {}` blocks but is not referenced by any `module { source = "<relpath>" }` block in the scan corpus. Conservative — only fires on directories with both an input/output contract and zero referrers. |
 | `graph_check` | Cross-resource detector dispatched to a registered Python function. The catalogue YAML names the function via `function: <name>` and the dispatcher in `detect.py` routes to `_GRAPH_CHECKS[name]`. Use this for conditions that span ≥2 resources (e.g., a logging target's hardening, a Workload Identity binding's bidirectionality). To add a new graph check: implement the function in `detect.py` next to `_GRAPH_CHECKS`, register it in that dict, then reference `kind: graph_check, function: <name>` in the catalogue YAML. |
+| `registry_check` | No offline finding: the rule is evaluated by the opt-in `--check-registry` pass, which compares each registry module's pinned version with the registry's latest. Used by `MOD-STALE-001`. No extra fields. |
 | `registry_fingerprint` | Module-reuse detector. Matches every directory's resource cluster against a fingerprint declared on the entry's top-level `fingerprint:` block (required types + supporting types + threshold + exclusions). One positive match per directory becomes one INFO-tier finding pointing at the registry module that the cluster resembles. Generic — no per-rule Python; add a new community-module rule by writing the YAML alone. See `MOD-REUSE-AWS-VPC-001.yaml` for a worked example. |
 
 ### `registry_fingerprint` schema

@@ -24,8 +24,9 @@ from __future__ import annotations
 
 import json
 import re
-import sys
 from pathlib import Path
+
+from _hcl import attrs_values_at, render_hcl
 
 
 # Pattern kinds whose evaluation only needs the resolved attribute
@@ -83,12 +84,137 @@ def plan_value_at_path(values: dict, path: str):
     return cur
 
 
+def _plan_suppressed(spec: dict | None, values: dict) -> bool:
+    """Plan/state counterpart of `_handlers_generic._suppressed_by`:
+    ``suppress_if: {arg, equals | regex}`` holds when any value at the
+    (possibly dotted) `arg` equals the literal, case-insensitively, or
+    matches the regex."""
+    if not spec or not spec.get("arg"):
+        return False
+    want = spec.get("equals")
+    for actual in plan_values_at(values, spec["arg"]):
+        if "regex" in spec:
+            if re.search(spec["regex"], str(actual)):
+                return True
+        elif want is not None and str(actual).lower() == str(want).lower():
+            return True
+    return False
+
+
+def _plan_name_selected(pat: dict, r: dict) -> bool:
+    """Plan/state counterpart of `_handlers_generic._name_selected`."""
+    values = r.get("values") or {}
+    names = [
+        n for n in (r.get("name") or r.get("address", "").split(".")[-1],
+                    values.get("name"), values.get("bucket"))
+        if isinstance(n, str)
+    ]
+    if pat.get("name_regex") and not any(re.search(pat["name_regex"], n) for n in names):
+        return False
+    if pat.get("name_not_regex") and any(re.search(pat["name_not_regex"], n) for n in names):
+        return False
+    return True
+
+
+def _plan_empty(value) -> bool:
+    """Plan / state JSON lists every unset attribute as ``null`` and every
+    unset nested block as ``[]``, so "present" means present and non-empty
+    — unlike static HCL, where an unset argument is simply absent."""
+    return value is None or value == [] or value == {}
+
+
+def plan_has_path(values: dict, path: str, *, every: bool = True) -> bool:
+    """Plan counterpart of `_hcl.attrs_has_path`: same walk (blocks are
+    lists of dicts, maps are dicts) and the same repeated-block rule —
+    every instance must have the rest of the path, or any one with
+    ``every=False`` — with `_plan_empty` values counting as absent."""
+    head, _, rest = path.partition(".")
+    if not isinstance(values, dict) or _plan_empty(values.get(head)):
+        return False
+    if not rest:
+        return True
+    value = values[head]
+    instances = value if isinstance(value, list) else [value]
+    instances = [i for i in instances if isinstance(i, dict)]
+    check = all if every else any
+    return bool(instances) and check(plan_has_path(i, rest, every=every) for i in instances)
+
+
+def plan_values_at(values: dict, path: str) -> list[str]:
+    """Every non-empty value at ``path`` across all instances, rendered as
+    HCL text with `_hcl.render_hcl` — so catalogue regexes see ``true``
+    (not Python's ``True``) and ``["a", "b"]`` (not ``['a', 'b']``), as
+    they do on the static path."""
+    return [render_hcl(v) for v in attrs_values_at(values, path) if not _plan_empty(v)]
+
+
+_INDEX_RE = re.compile(r'\[[^\]]*\]')
+
+
+def _module_prefix(address: str) -> str:
+    """``module.a.module.b.`` for ``module.a[0].module.b.aws_x.y[1]`` —
+    the (index-free) module path an address lives in."""
+    parts = _INDEX_RE.sub("", address).split(".")
+    return "".join(f"module.{parts[i + 1]}." for i in range(0, len(parts) - 2, 2)
+                   if parts[i] == "module")
+
+
+def config_references(plan: dict) -> dict[str, dict[str, list[str]]]:
+    """``{address: {arg: [referenced addresses]}}`` from a plan's
+    ``configuration`` section, addresses index-free and module-prefixed.
+    Planned values lose references (``bucket = aws_s3_bucket.x.id`` is
+    unknown until apply); the configuration keeps them."""
+    out: dict[str, dict[str, list[str]]] = {}
+
+    def walk(module: dict | None, prefix: str) -> None:
+        for r in (module or {}).get("resources") or []:
+            refs = {
+                arg: [prefix + ref for ref in (expr or {}).get("references") or []]
+                for arg, expr in (r.get("expressions") or {}).items()
+                if isinstance(expr, dict)
+            }
+            out[prefix + r.get("address", "")] = refs
+        for name, call in ((module or {}).get("module_calls") or {}).items():
+            walk((call or {}).get("module"), f"{prefix}module.{name}.")
+
+    walk((plan.get("configuration") or {}).get("root_module"), "")
+    return out
+
+
+def _has_companion(
+    r: dict, spec: dict, resources: list[dict],
+    references: dict[str, dict[str, list[str]]],
+) -> bool:
+    """Plan/state counterpart of `_handlers_generic._has_companion`: a
+    resource of type ``spec["resource"]`` in the same module points at `r`
+    through its ``spec["via"]`` argument — by equal value (always known in
+    state), or by reference in the plan configuration."""
+    ctype, via = spec.get("resource"), spec.get("via", "bucket")
+    own_addr = _INDEX_RE.sub("", r.get("address", ""))
+    own_value = (r.get("values") or {}).get(via)
+    module = _module_prefix(own_addr)
+    for cand in resources:
+        if cand.get("type") != ctype:
+            continue
+        cand_addr = _INDEX_RE.sub("", cand.get("address", ""))
+        if _module_prefix(cand_addr) != module:
+            continue
+        value = (cand.get("values") or {}).get(via)
+        if own_value is not None and value == own_value:
+            return True
+        if any(ref == own_addr or ref.startswith(own_addr + ".")
+               for ref in references.get(cand_addr, {}).get(via, [])):
+            return True
+    return False
+
+
 def evaluate_against_resources(
     resources: list[dict],
     entries: list[dict],
     *,
     finding_mode: str,
     file_marker: str,
+    references: dict[str, dict[str, list[str]]] | None = None,
 ) -> list[dict]:
     """Re-evaluate plan-supported rule kinds against a flat resource list.
 
@@ -105,26 +231,47 @@ def evaluate_against_resources(
             kind = pat.get("kind", "")
             if kind not in PLAN_SUPPORTED_KINDS:
                 continue
+            # `unless_repo_has`, as on the static path: the account-level
+            # resource is in the plan and not `enabled = false`.
+            if pat.get("unless_repo_has") and any(
+                r.get("type") == pat["unless_repo_has"]
+                and (r.get("values") or {}).get("enabled") is not False
+                for r in resources
+            ):
+                continue
             if kind == "resource_arg":
+                # Same semantics as the static handler: value at
+                # nested_path or (possibly dotted) arg, any instance
+                # matching fires, fire_if_absent fires when any instance
+                # lacks it.
                 rt = pat.get("resource")
-                arg = pat.get("arg")
+                path = pat.get("nested_path") or pat.get("arg")
                 regex_str = pat.get("regex")
                 not_regex_str = pat.get("not_regex")
-                if not (rt and arg and (regex_str or not_regex_str)):
+                if not (rt and path and (regex_str or not_regex_str)):
                     continue
                 regex = re.compile(regex_str) if regex_str else None
                 not_regex = re.compile(not_regex_str) if not_regex_str else None
+                fire_if_absent = pat.get("fire_if_absent", False)
                 for r in resources:
                     if r.get("type") != rt:
                         continue
-                    val = (r.get("values") or {}).get(arg)
-                    if val is None:
+                    rvalues = r.get("values") or {}
+                    if _plan_suppressed(pat.get("suppress_if"), rvalues):
                         continue
-                    hit = False
-                    if regex and regex.search(str(val)):
+                    if not _plan_name_selected(pat, r):
+                        continue
+                    vals = plan_values_at(rvalues, path)
+                    if fire_if_absent and (not vals or not plan_has_path(rvalues, path)):
                         hit = True
-                    if not_regex and not not_regex.search(str(val)):
-                        hit = True
+                    elif not vals:
+                        continue
+                    else:
+                        hit = any(
+                            (regex and regex.search(v))
+                            or (not_regex and not not_regex.search(v))
+                            for v in vals
+                        )
                     if hit:
                         findings.append({
                             "id": eid,
@@ -135,22 +282,26 @@ def evaluate_against_resources(
                         })
             elif kind == "resource_missing_arg":
                 rt = pat.get("resource")
-                arg_path = pat.get("arg") or pat.get("nested_path")
+                # nested_path first, as on the static path.
+                arg_path = pat.get("nested_path") or pat.get("arg")
                 if not (rt and arg_path):
                     continue
                 suppress_if = pat.get("suppress_if")
+                every = pat.get("instances", "all") != "any"
+                companion = pat.get("unless_companion")
                 for r in resources:
                     if r.get("type") != rt:
                         continue
-                    val = plan_value_at_path(r.get("values") or {}, arg_path)
-                    if val in (None, [], {}):
-                        if suppress_if:
-                            s_arg = suppress_if.get("arg", "")
-                            s_val = suppress_if.get("equals")
-                            if s_arg and s_val is not None:
-                                actual = plan_value_at_path(r.get("values") or {}, s_arg)
-                                if actual is not None and str(actual).lower() == str(s_val).lower():
-                                    continue
+                    rvals = r.get("values") or {}
+                    if not _plan_name_selected(pat, r):
+                        continue
+                    if companion and _has_companion(
+                        r, companion, resources, references or {},
+                    ):
+                        continue
+                    if not plan_has_path(rvals, arg_path, every=every):
+                        if _plan_suppressed(suppress_if, rvals):
+                            continue
                         findings.append({
                             "id": eid,
                             "file": file_marker,
@@ -190,13 +341,16 @@ def evaluate_against_resources(
                 not_equal = pat.get("not_equal")
                 if not (rt and path):
                     continue
+                if not_equal is None:
+                    continue
+                ne_norm = str(not_equal).strip().strip('"').strip("'").lower()
                 for r in resources:
                     if r.get("type") != rt:
                         continue
-                    val = plan_value_at_path(r.get("values") or {}, path)
-                    if val is None:
-                        continue
-                    if not_equal is not None and str(val).lower() != str(not_equal).lower():
+                    if any(
+                        v.strip().strip('"').strip("'").lower() != ne_norm
+                        for v in plan_values_at(r.get("values") or {}, path)
+                    ):
                         findings.append({
                             "id": eid,
                             "file": file_marker,
@@ -205,6 +359,12 @@ def evaluate_against_resources(
                             "mode": finding_mode,
                         })
     return findings
+
+
+class PlanInputError(ValueError):
+    """A `--plan-json` / `--state-json` file that cannot be scanned. The
+    readers used to print ERROR and return no findings, so a broken or
+    wrong-kind file passed a `--fail-on` gate having checked nothing."""
 
 
 def detect_in_plan(plan_json_path: Path, entries: list[dict]) -> list[dict]:
@@ -224,32 +384,34 @@ def detect_in_plan(plan_json_path: Path, entries: list[dict]) -> list[dict]:
     try:
         text = plan_json_path.read_text()
     except FileNotFoundError:
-        print(
-            f"ERROR: plan JSON not found: {plan_json_path}. "
-            f"Did `terraform show -json` run successfully?",
-            file=sys.stderr,
+        raise PlanInputError(
+            f"plan JSON not found: {plan_json_path}. "
+            f"Did `terraform show -json` run successfully?"
         )
-        return []
     except OSError as e:
-        print(
-            f"ERROR: cannot read plan JSON {plan_json_path} (OS error): {e}",
-            file=sys.stderr,
+        raise PlanInputError(
+            f"cannot read plan JSON {plan_json_path} (OS error): {e}"
         )
-        return []
     try:
         plan = json.loads(text)
     except json.JSONDecodeError as e:
-        print(
-            f"ERROR: plan JSON at {plan_json_path} is malformed: {e}. "
-            f"First 200 chars: {text[:200]!r}",
-            file=sys.stderr,
+        raise PlanInputError(
+            f"plan JSON at {plan_json_path} is malformed: {e}. "
+            f"First 200 chars: {text[:200]!r}"
         )
-        return []
+    if not isinstance(plan, dict) or "planned_values" not in plan:
+        hint = (" It looks like state output: use --state-json."
+                if isinstance(plan, dict) and "values" in plan else "")
+        raise PlanInputError(
+            f"{plan_json_path} is not `terraform show -json` plan output "
+            f"(no planned_values).{hint}"
+        )
     resources = walk_plan_resources(plan.get("planned_values") or {})
     return evaluate_against_resources(
         resources, entries,
         finding_mode="plan",
         file_marker="<plan>",
+        references=config_references(plan),
     )
 
 
@@ -271,29 +433,29 @@ def detect_in_state(state_json_path: Path, entries: list[dict]) -> list[dict]:
     try:
         text = state_json_path.read_text()
     except FileNotFoundError:
-        print(
-            f"ERROR: state JSON not found: {state_json_path}. "
-            f"Did `terraform show -json` run successfully?",
-            file=sys.stderr,
+        raise PlanInputError(
+            f"state JSON not found: {state_json_path}. "
+            f"Did `terraform show -json` run successfully?"
         )
-        return []
     except OSError as e:
-        print(
-            f"ERROR: cannot read state JSON {state_json_path} (OS error): {e}",
-            file=sys.stderr,
+        raise PlanInputError(
+            f"cannot read state JSON {state_json_path} (OS error): {e}"
         )
-        return []
     try:
         state = json.loads(text)
     except json.JSONDecodeError as e:
-        print(
-            f"ERROR: state JSON at {state_json_path} is malformed: {e}. "
-            f"First 200 chars: {text[:200]!r}",
-            file=sys.stderr,
+        raise PlanInputError(
+            f"state JSON at {state_json_path} is malformed: {e}. "
+            f"First 200 chars: {text[:200]!r}"
         )
-        return []
     # plan.tfplan → planned_values; state.tfstate → values; both share
     # the same {root_module, child_modules} shape underneath.
+    # An empty state has no `values`, so only the wrong kind is refused.
+    if not isinstance(state, dict) or ("planned_values" in state and "values" not in state):
+        hint = " It looks like plan output: use --plan-json." if isinstance(state, dict) else ""
+        raise PlanInputError(
+            f"{state_json_path} is not `terraform show -json` state output.{hint}"
+        )
     root = state.get("values") or {}
     resources = walk_plan_resources(root)
     return evaluate_against_resources(

@@ -32,8 +32,11 @@ Pattern kinds supported:
     resource_missing_arg+     same, but arg may be a nested.dotted.path
     resource_present          any resource of type T (urgency comes from default)
     resource_absent           NO resource of type T anywhere in scope (file=*)
+    resource_missing_companion  resource of type T that no companion C in its
+                              module points at (per-resource resource_absent)
     hcl_attr                  resource type T whose attr A is a literal value
     module_block_missing_arg  module block whose source matches regex lacks arg
+    registry_check            none offline; findings come from --check-registry
     variable_type             variable block with `type = <regex>`
     variable_missing_validation  variable block of name regex with no `validation`
     variable_unused           variable declared but never referenced as var.X
@@ -65,6 +68,7 @@ Pattern kinds supported:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import difflib
 import hashlib
 import io
@@ -73,16 +77,18 @@ import fnmatch
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
-# ---- Optional python-hcl2 fast-path -------------------------------------
-# Moved into `scripts/_hcl.py` in Session F so `_cross_resource.py` and
-# any other sibling module can reach `block_arg_value` without
-# circular-importing back through `detect`. The toggle (`_USE_HCL2`)
-# and detection wrappers are re-imported below alongside the other
-# pure HCL primitives.
+# ---- python-hcl2 ----------------------------------------------------------
+# The vendored parser is loaded by `scripts/_hcl.py` (always on since the
+# parser migration, tasks/hcl-parser-migration.md §7); `block_arg_value`
+# lives there too so `_cross_resource.py` can reach it without
+# circular-importing back through `detect`.
 
 # Provider/Terraform version-constraint helpers live in
 # `scripts/_versions.py`. Re-imported here under the legacy private
@@ -98,17 +104,18 @@ from _versions import (
 )
 
 
-# HCL primitives + `_USE_HCL2` toggle + `block_arg_value` wrapper all
-# live in `scripts/_hcl.py`. Fourth seam in the modularisation; Session
-# F (R30.0.12) brought the toggle + `block_arg_value` into `_hcl.py` so
-# `_cross_resource.py` could import them cleanly without a circular
+# HCL primitives + `block_arg_value` wrapper all live in
+# `scripts/_hcl.py`. Fourth seam in the modularisation; Session F
+# (R30.0.12) brought `block_arg_value` into `_hcl.py` so
+# `_cross_resource.py` could import it cleanly without a circular
 # import back through `detect`.
 from _hcl import (
     _LINE_COMMENT_RE,
     _BLOCK_COMMENT_RE,
     _DYNAMIC_BLOCK_START_RE,
-    _HAS_HCL2,
     _read_normalized,
+    _mask_to_top_level,
+    render_hcl,
     _parse_scalar,
     strip_hcl_context,
     find_blocks,
@@ -120,8 +127,16 @@ from _hcl import (
     block_has_nested_path,
     _expand_dynamic_blocks,
     _hcl2_block_arg_value,
-    _enable_hcl2_or_warn,
-    _enable_hcl2_default,
+    parse_tf,
+    comments_only,
+    normalise_attrs,
+    resource_subtrees,
+    resource_values_at,
+)
+from _network import parse_literal as _net_parse_literal, resolve as _net_resolve
+from _meta import __version__
+from _tfjson import (
+    is_tf_json, is_tf_source, read_tf_source, remap_lines, tf_source_files,
 )
 
 
@@ -143,6 +158,12 @@ from _catalog import (
     _load_project_config,
     load_catalog,
 )
+
+
+def _read_tf_source(path: Path) -> str:
+    """Text to scan for a `.tf` / `.tf.json` file (`.tf.json` is rendered
+    as the equivalent HCL; see `_tfjson`)."""
+    return read_tf_source(path, _read_normalized)
 
 
 # ---- Resource block extraction ------------------------------------------
@@ -186,7 +207,8 @@ COUNT_GUARD_RE = re.compile(r'\?|try\s*\(|length\s*\(|one\s*\(')
 
 
 def _path_is_ignored(path: Path, target: Path, ignore_paths: list) -> bool:
-    """Return True when ``path`` should be skipped per ``ignore_paths``.
+    """Return True when ``path`` should be skipped per ``ignore_paths`` —
+    or, always, when it resolves outside ``target`` (a symlink out).
 
     Each entry is matched against the file's path *relative to the scan
     target* (so users write paths the way they'd type them at the repo
@@ -201,11 +223,20 @@ def _path_is_ignored(path: Path, target: Path, ignore_paths: list) -> bool:
     can scan only its production code instead of self-scoring against
     the fixtures.
     """
-    if not ignore_paths:
-        return False
     try:
         rel = path.resolve().relative_to(target.resolve())
     except ValueError:
+        # A symlink that resolves outside the target: scanning it would
+        # read (and print excerpts of) files the target does not contain
+        # — e.g. `x.tf -> ../.git/config` in CI — and `--apply-fixes`
+        # would write through it. Always skipped.
+        print(
+            f"WARN: skipping {path}: it resolves outside the target "
+            f"({path.resolve()})",
+            file=sys.stderr,
+        )
+        return True
+    if not ignore_paths:
         return False
     rel_parts = rel.parts
     for raw in ignore_paths:
@@ -332,85 +363,144 @@ def _resolve_var_ref(val: str, var_defaults: dict) -> str:
     return val
 
 
-def _extract_var_defaults_by_dir(all_files_text: dict) -> dict:
-    """Return {dir_path: {var_name: default_value}} for all declared variable
-    defaults AND locals values, then layer module-call inputs on top.
+_TOP_LEVEL_ASSIGN_RE = re.compile(r'(?m)^[ \t]*([\w-]+)[ \t]*=(?!=)')
+# Variable-definition files Terraform loads automatically, in precedence
+# order (later wins); see `_tfvars_values`.
+_TFVARS_FIXED = ("terraform.tfvars", "terraform.tfvars.json")
+_MODULE_META_ARGS = frozenset({
+    "source", "version", "providers", "count", "for_each", "depends_on",
+    "lifecycle",
+})
+# One child module called from many places is scanned once per distinct
+# set of caller inputs, up to this many.
+_MAX_VAR_CONTEXTS = 8
 
-    Variable scope in Terraform is per-directory.  Locals are stored under
-    the key ``__local__<name>`` in the same per-directory dict so that a
-    single lookup table can serve both namespaces.
 
-    Module-input flow-through: for every `module "x" { source = "./child"; foo
-    = bar }`, push `foo = bar` into the child directory's dict so child-module
-    rules see the *caller's* override rather than the child's default.
+def _top_level_assignments(body: str) -> dict[str, str]:
+    """``{name: value}`` for every top-level ``name = value`` of a block
+    body (or a `.tfvars` file) — never a key inside a nested object, block,
+    string or comment, so ``defaults = { pub = false }`` does not define
+    ``pub``. Values come from `block_arg_value` (comments stripped,
+    surrounding quotes removed, multi-line collections kept whole)."""
+    out: dict[str, str] = {}
+    for m in _TOP_LEVEL_ASSIGN_RE.finditer(_mask_to_top_level(body)):
+        name = m.group(1)
+        if name in out:
+            continue
+        value = block_arg_value(body, name)
+        if value is not None:
+            out[name] = value
+    return out
+
+
+def _tfvars_scalar(value) -> str:
+    """A `.tfvars.json` value in the text form `block_arg_value` gives."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)):
+        return json.dumps(value)
+    return render_hcl(value)
+
+
+def _tfvars_values(directory: Path) -> dict[str, str]:
+    """Variable values from the definition files Terraform loads on its
+    own in `directory`: ``terraform.tfvars`` (and ``.json``), then every
+    ``*.auto.tfvars`` (and ``.json``) in lexical order, each overriding the
+    last. (``-var`` / ``-var-file`` are invocation-time and unknowable.)
+    A file that is a symlink out of `directory` is not read."""
+    out: dict[str, str] = {}
+    try:
+        autos = sorted(
+            p.name for p in directory.iterdir()
+            if p.name.endswith((".auto.tfvars", ".auto.tfvars.json"))
+        )
+    except OSError:
+        return out
+    root = directory.resolve()
+    for name in (*_TFVARS_FIXED, *autos):
+        path = directory / name
+        try:
+            if not path.is_file() or not path.resolve().is_relative_to(root):
+                continue
+            text = _read_normalized(path)
+        except OSError:
+            continue
+        if name.endswith(".json"):
+            try:
+                doc = json.loads(text)
+            except ValueError:
+                continue
+            if isinstance(doc, dict):
+                out.update({k: _tfvars_scalar(v) for k, v in doc.items()})
+        else:
+            out.update(_top_level_assignments(text))
+    return out
+
+
+def _extract_var_contexts_by_dir(all_files_text: dict) -> dict[str, list[dict]]:
+    """Return ``{dir_path: [context, ...]}``: the values `var.X` /
+    `local.X` resolve to when a directory's files are scanned.
+
+    A context holds variable defaults, then values from the directory's
+    auto-loaded ``.tfvars`` files, then — for a child module — the inputs
+    its caller passes (``module "x" { source = "./child"; foo = bar }``
+    sets the child's ``foo``). Locals are stored under ``__local__<name>``
+    in the same dict, so one lookup table serves both namespaces.
+
+    Variable scope in Terraform is per-directory, so most directories have
+    one context. A child module called from several places with different
+    inputs has one context per distinct set, so a rule sees each caller's
+    values — with a single merged dict, whichever caller came last hid the
+    others (a `public = true` caller behind a `public = false` one).
     """
-    result: dict[str, dict[str, str]] = {}
+    base: dict[str, dict[str, str]] = {}
     for fp, text in all_files_text.items():
         dir_key = str(Path(fp).parent)
         for blk in find_blocks(text, VARIABLE_START):
-            var_name = blk["groups"][0]
             default = block_arg_value(blk["body"], "default")
             if default is not None:
-                result.setdefault(dir_key, {})[var_name] = default
-        # Locals blocks: `locals { name = value ... }`  (no groups — use find_blocks
-        # variant that returns body only via LOCALS_START which has no capture groups).
+                base.setdefault(dir_key, {})[blk["groups"][0]] = default
         for blk in find_blocks(text, LOCALS_START):
-            body = blk["body"]
-            # Each line of the body is a `name = value` assignment.
-            for lm in re.finditer(r'(?m)^\s*([\w-]+)\s*=\s*(.+?)\s*$', body):
-                lname, raw = lm.group(1), lm.group(2)
-                # Audit fix #12 — the trailing-comment strip used to be
-                # `re.sub(r'\s*#.*$', '', raw)` which is quote-blind: a
-                # value like `"value # not a comment"` lost everything
-                # from `#` onward. Walk the raw value tracking quote
-                # state (matches `_hcl.block_arg_value`'s escape-aware
-                # quote walker) and only strip a `#` that lives outside
-                # a quoted region.
-                in_dq = in_sq = False
-                prev = ""
-                cut = None
-                for idx, ch in enumerate(raw):
-                    escaped = prev == "\\"
-                    if ch == '"' and not in_sq and not escaped:
-                        in_dq = not in_dq
-                    elif ch == "'" and not in_dq and not escaped:
-                        in_sq = not in_sq
-                    elif ch == "#" and not in_dq and not in_sq:
-                        cut = idx
-                        break
-                    prev = ch
-                cleaned = raw[:cut].rstrip() if cut is not None else raw.rstrip()
-                lval = cleaned.strip().strip('"').strip("'")
-                result.setdefault(dir_key, {})["__local__" + lname] = lval
+            for lname, lval in _top_level_assignments(blk["body"]).items():
+                base.setdefault(dir_key, {})["__local__" + lname] = lval
+    for dir_key in sorted({str(Path(fp).parent) for fp in all_files_text}):
+        tfvars = _tfvars_values(Path(dir_key))
+        if tfvars:
+            base.setdefault(dir_key, {}).update(tfvars)
 
     # AWS provider `default_tags { tags = { ... } }`: any dir whose AWS
     # provider declares default_tags is recorded under the synthetic key
     # __aws_default_tags__. Tag-related findings in that dir are then
     # suppressed (the provider injects the tags downstream).
-    PROVIDER_AWS = re.compile(r'^\s*provider\s+"aws"\s*\{', re.MULTILINE)
     for fp, text in all_files_text.items():
-        for pm in PROVIDER_AWS.finditer(text):
-            # Round-30.13 — shared brace walker. The provider block
-            # extraction was previously quote-blind; an aws provider
-            # config with a `default_tags { tags = { ... } }` map whose
-            # value contained `"k = "v}"`` (rare but possible) would
-            # have closed the block prematurely.
-            end_after = brace_walk(text, pm.end() - 1)
-            if end_after is None:
-                continue
-            end = end_after - 1  # position of the matching `}` itself
-            pbody = text[pm.end():end]
-            if "default_tags" in pbody:
-                dirk = str(Path(fp).parent)
-                result.setdefault(dirk, {})["__aws_default_tags__"] = "true"
+        for pblk in find_blocks(text, PROVIDER_START):
+            # A real `default_tags` block, not the word in a comment or
+            # string (`# TODO: add default_tags` silenced every AWS tag rule).
+            if pblk["groups"][0] == "aws" and block_has_arg(pblk["body"], "default_tags"):
+                base.setdefault(str(Path(fp).parent), {})["__aws_default_tags__"] = "true"
 
-    # Module-input flow-through: parent's `module "x" { source = "./c"; k = v }`
-    # overrides child dir's `var.k` default. Only literal values flow; var.Y
-    # references are resolved against the parent's already-built dict.
-    for fp, text in all_files_text.items():
+    # Resource types present anywhere in the scan, minus ones switched off
+    # with `enabled = false`, for `unless_repo_has` (account-level settings
+    # such as aws_ebs_encryption_by_default live in another module).
+    present = sorted({
+        blk["groups"][0]
+        for text in all_files_text.values()
+        for blk in find_blocks(text, RESOURCE_START)
+        if block_arg_value(blk["body"], "enabled") != "false"
+    })
+    if present:
+        for dir_key in {str(Path(fp).parent) for fp in all_files_text}:
+            base.setdefault(dir_key, {})["__repo_has__"] = " ".join(present)
+
+    # Module calls, in a stable order: (caller dir, child dir, inputs).
+    calls: list[tuple[str, str, dict[str, str]]] = []
+    for fp in sorted(all_files_text, key=str):
         parent_dir = str(Path(fp).parent)
-        parent_vd = result.get(parent_dir, {})
-        for mblk in find_blocks(text, MODULE_START):
+        for mblk in find_blocks(all_files_text[fp], MODULE_START):
             source = block_arg_value(mblk["body"], "source")
             if not source or not source.startswith((".", "/")):
                 continue
@@ -418,57 +508,72 @@ def _extract_var_defaults_by_dir(all_files_text: dict) -> dict:
                 child_dir = str((Path(parent_dir) / source).resolve())
             except (OSError, ValueError):
                 continue
-            for lm in re.finditer(r'(?m)^\s*([\w-]+)\s*=\s*(.+?)\s*$', mblk["body"]):
-                k, raw = lm.group(1), lm.group(2)
-                # Strip trailing `#` comments before resolution. Otherwise
-                # `encrypted = false   # caller note` flows as the literal
-                # string `false   # caller note` and downstream rules miss
-                # the value match.
-                #
-                # Round-4 audit fix #7 — the locals branch 60 lines
-                # above this site uses a quote-aware comment stripper
-                # (R30.10). This sibling path still used the bare
-                # `re.sub(r'\s*#.*$', '', raw)` which is quote-blind:
-                # `count = "value # not a comment"` lost everything
-                # from `#` onward. Mirror the locals walker.
-                in_dq = in_sq = False
-                prev = ""
-                cut = None
-                for idx, ch in enumerate(raw):
-                    escaped = prev == "\\"
-                    if ch == '"' and not in_sq and not escaped:
-                        in_dq = not in_dq
-                    elif ch == "'" and not in_dq and not escaped:
-                        in_sq = not in_sq
-                    elif ch == "#" and not in_dq and not in_sq:
-                        cut = idx
-                        break
-                    prev = ch
-                v = (raw[:cut] if cut is not None else raw).rstrip()
-                if k in ("source", "version", "providers", "count", "for_each",
-                         "depends_on", "lifecycle"):
-                    continue
-                resolved = _resolve_var_ref(v, parent_vd)
-                resolved = resolved.strip().strip('"').strip("'")
-                # Only flow values that look like literals after resolution;
-                # leave child default in place when caller passes an unresolved
-                # expression.
-                if resolved and not resolved.startswith(("var.", "local.", "data.")):
-                    result.setdefault(child_dir, {})[k] = resolved
-    return result
+            inputs = {
+                k: v for k, v in _top_level_assignments(mblk["body"]).items()
+                if k not in _MODULE_META_ARGS
+            }
+            calls.append((parent_dir, child_dir, inputs))
+
+    contexts: dict[str, list[dict]] = {}
+    in_progress: set[str] = set()
+
+    def contexts_of(d: str) -> list[dict]:
+        if d in contexts:
+            return contexts[d]
+        own = base.get(d, {})
+        incoming = [(p, inputs) for p, c, inputs in calls if c == d]
+        if d in in_progress:  # a call cycle: stop at this module's own values
+            return [dict(own)]
+        if not incoming:  # a root module
+            contexts[d] = [dict(own)]
+            return contexts[d]
+        in_progress.add(d)
+        found: list[dict] = []
+        for parent_dir, inputs in incoming:
+            for parent_ctx in contexts_of(parent_dir):
+                ctx = dict(own)
+                for k, raw in inputs.items():
+                    # Only literal values flow (after resolving the caller's
+                    # own var./local. references); an unresolved expression
+                    # leaves the child's default in place.
+                    resolved = _resolve_var_ref(raw, parent_ctx)
+                    resolved = resolved.strip().strip('"').strip("'")
+                    if resolved and not resolved.startswith(("var.", "local.", "data.")):
+                        ctx[k] = resolved
+                if ctx not in found and len(found) < _MAX_VAR_CONTEXTS:
+                    found.append(ctx)
+        in_progress.discard(d)
+        contexts[d] = found
+        return found
+
+    for d in sorted(set(base) | {c for _, c, _ in calls}):
+        contexts_of(d)
+    return contexts
+
+
+def _extract_var_defaults_by_dir(all_files_text: dict) -> dict:
+    """``{dir_path: context}`` — the first context of each directory from
+    `_extract_var_contexts_by_dir`, for callers that scan with one
+    variable table (the LSP server)."""
+    return {d: ctxs[0] for d, ctxs in _extract_var_contexts_by_dir(all_files_text).items()}
 
 
 def _resource_is_count_zero(body: str, var_defaults: dict) -> bool:
-    """Return True if the resource block has `count = 0` (definitely not created).
+    """Return True if the resource block has a literal `count = 0` (definitely
+    not created), so rules can skip it.
 
-    Resolves `var.X` and `local.X` references against known defaults.  When
-    count is a non-resolvable expression the function returns False (safe default
-    — don't skip a resource we can't prove is absent).
+    Only literals count — including a ternary on a literal condition
+    (`false ? 1 : 0`). A count that depends on `var.X` / `local.X` is NOT
+    resolved against defaults: tfvars / -var can override the default at
+    apply time, so `count = var.enabled ? 1 : 0` with `default = false` is
+    still checked (decided in tasks/hcl-parser-migration.md §14 item 25).
+    `var_defaults` is accepted for call-site compatibility and ignored.
     """
+    del var_defaults  # deliberately unused — see docstring
     val = block_arg_value(body, "count")
     if val is None:
         return False
-    val = _resolve_var_ref(val, var_defaults)
+    val = _resolve_var_ref(val, {})
     try:
         return int(val) == 0
     except (ValueError, TypeError):
@@ -514,6 +619,99 @@ class InFileCtx:
     entry: dict
     eid: str
     pat: dict
+    # Every resource block in the file's directory (module), for checks
+    # that look at a sibling resource in another file — e.g.
+    # `unless_companion`. None when the caller scans a file on its own;
+    # handlers then fall back to `resources`.
+    module_resources: list[dict] | None = None
+
+
+# ---- Per-pattern time budget -------------------------------------------
+# A rule's regex can backtrack exponentially on crafted input (a ReDoS:
+# SEC-K8S-SECRET-001 once took hours on 40 list items), and custom rules
+# from a scanned repo's `rules_dir` are never reviewed. Each handler call
+# runs under a wall-clock budget; a timeout drops that pattern's findings
+# for that file, is warned about, and fails the `--fail-on` gate like an
+# unreadable file (a scan that skipped a check has not passed it).
+# Python's `re` honours signals mid-match, so SIGALRM interrupts it.
+# Unix main thread only; elsewhere the budget is not enforced.
+PATTERN_TIME_BUDGET_S = float(os.environ.get("TF_ANALYZE_PATTERN_TIMEOUT", "5"))
+RULE_TIMEOUTS: list[dict] = []
+# The running pattern: armed while its handler runs, and when it started.
+# One kernel timer serves the whole scan loop (`_pattern_budget_scope`);
+# per call only these are set — re-arming the timer around each of the
+# ~400k pattern calls in a large scan doubled its cost (+50 %).
+_BUDGET_ARMED = False
+_PATTERN_STARTED = 0.0
+
+
+class _PatternTimeout(BaseException):
+    """A `BaseException`, like `KeyboardInterrupt`, so a handler's
+    `except Exception` (the policy DSL, IAM policy decoding) cannot
+    swallow it and keep running past the budget."""
+
+
+def _on_budget_alarm(signum, frame):
+    """SIGALRM: stop the running pattern if it has used its whole budget;
+    otherwise re-arm the timer for the time it has left (or a full budget
+    between patterns), so each pattern still gets exactly its budget."""
+    if _BUDGET_ARMED:
+        remaining = _PATTERN_STARTED + PATTERN_TIME_BUDGET_S - time.monotonic()
+        if remaining <= 0:
+            raise _PatternTimeout()
+    else:
+        remaining = PATTERN_TIME_BUDGET_S
+    signal.setitimer(signal.ITIMER_REAL, max(remaining, 0.001))
+
+
+@contextlib.contextmanager
+def _pattern_budget_scope():
+    """Install the handler and start the timer around a scan loop; yields
+    whether budgets are enforced: Unix main thread, budget > 0."""
+    if (
+        PATTERN_TIME_BUDGET_S <= 0
+        or not hasattr(signal, "setitimer")
+        or threading.current_thread() is not threading.main_thread()
+    ):
+        yield False
+        return
+    previous = signal.signal(signal.SIGALRM, _on_budget_alarm)
+    signal.setitimer(signal.ITIMER_REAL, PATTERN_TIME_BUDGET_S)
+    try:
+        yield True
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def _call_with_budget(handler, ctx, eid: str, where: str, enforced: bool) -> list[dict]:
+    """``handler(ctx)`` under `PATTERN_TIME_BUDGET_S` when `enforced` (inside
+    `_pattern_budget_scope`); [] on timeout, recorded in `RULE_TIMEOUTS`."""
+    global _BUDGET_ARMED, _PATTERN_STARTED
+    if not enforced:
+        return handler(ctx)
+    _PATTERN_STARTED = time.monotonic()
+    _BUDGET_ARMED = True
+    try:
+        found = handler(ctx)
+        # Belt and braces: should anything still swallow the timeout, an
+        # overrun is recorded and its (possibly partial) findings dropped.
+        timed_out = time.monotonic() - _PATTERN_STARTED >= PATTERN_TIME_BUDGET_S
+    except _PatternTimeout:
+        timed_out = True
+    finally:
+        _BUDGET_ARMED = False
+    if not timed_out:
+        return found
+    # The alarm that stopped it is spent: re-arm for the patterns after it.
+    signal.setitimer(signal.ITIMER_REAL, PATTERN_TIME_BUDGET_S)
+    RULE_TIMEOUTS.append({"rule": eid, "file": where})
+    print(
+        f"WARN: {eid} exceeded its {PATTERN_TIME_BUDGET_S:g}s budget on {where}; "
+        f"skipped (a pattern backtracking on this input?)",
+        file=sys.stderr,
+    )
+    return []
 
 
 _INFILE_HANDLERS: dict[str, _Callable[["InFileCtx"], list[dict]]] = {}
@@ -542,13 +740,70 @@ def _register_infile(kind: str):
     return deco
 
 
+_URGENCY_ORDER = ("INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL")
+
+
+def _escalation_matches(match: dict, finding: dict, blk: dict | None,
+                        var_defaults: dict) -> bool:
+    """True when every condition in a structured ``escalation: match:``
+    holds for this finding. ``ports: [..]`` checks the open port ranges a
+    network handler attached (``_open_port_ranges``); any other key is an
+    attribute path whose value (or any list element, after resolving
+    ``var.X`` / ``local.X``) must match the regex given."""
+    for key, want in match.items():
+        if key == "ports":
+            ranges = [r for r in finding.get("_open_port_ranges") or [] if r]
+            if not any(lo <= int(p) <= hi for lo, hi in ranges for p in want):
+                return False
+            continue
+        if blk is None:
+            return False
+        regex = re.compile(str(want))
+        candidates: list = []
+        for raw in resource_values_at(blk, key):
+            v = _net_resolve(_net_parse_literal(raw), var_defaults)
+            candidates.extend(v if isinstance(v, list) else [v])
+        if not any(regex.search(str(v)) for v in candidates):
+            return False
+    return True
+
+
+def _apply_structured_escalation(found: list[dict], entry: dict,
+                                 resources: list[dict], var_defaults: dict) -> None:
+    """Raise a finding's urgency per the entry's structured escalations
+    (``- match: {...}  urgency: CRITICAL``). Free-text ``condition:``
+    escalations are judgement-pass metadata (SKILL.md) and are ignored
+    here. Urgency only ever goes up. Removes the handler-internal
+    ``_open_port_ranges`` key either way (tasks/hcl-parser-migration.md
+    §4.10)."""
+    rules = [x for x in entry.get("escalation") or []
+             if isinstance(x, dict) and isinstance(x.get("match"), dict)]
+    by_addr = {f"{b['groups'][0]}.{b['groups'][1]}": b for b in resources}
+    for f in found:
+        if rules:
+            current = f.get("urgency") or entry.get("default_urgency", "MEDIUM")
+            for x in rules:
+                if _escalation_matches(x["match"], f, by_addr.get(f.get("resource", "")),
+                                       var_defaults):
+                    target = str(x.get("urgency") or x.get("new_urgency") or current).upper()
+                    if _URGENCY_ORDER.index(target) > _URGENCY_ORDER.index(current):
+                        current = target
+            if current != entry.get("default_urgency", "MEDIUM") or "urgency" in f:
+                f["urgency"] = current
+        f.pop("_open_port_ranges", None)
+
+
 def detect_in_file(
     file_path: Path,
     text: str,
     entries: list[dict],
     var_defaults: dict | None = None,
+    module_resources: list[dict] | None = None,
 ) -> list[dict]:
     """Run per-file detection patterns against a single .tf file.
+
+    module_resources: every resource block in the file's directory (see
+    `InFileCtx.module_resources`).
 
     var_defaults: directory-scoped {var_name: default_value} map built by
     _extract_var_defaults_by_dir(). When supplied, plain `var.X` attribute
@@ -563,34 +818,57 @@ def detect_in_file(
     # match attributes that live inside dynamically-generated nested blocks.
     for _blk in resources:
         _blk["body"] = _expand_dynamic_blocks(_blk["body"])
+    # Parser migration Step 2: attach each resource's parsed subtree as
+    # `attrs` (dynamic blocks folded in). Joined to the regex block on
+    # (type, name); `attrs` is None — and handlers use the regex fallback —
+    # when the file did not parse, is not `.tf`, or the key is ambiguous
+    # (seen twice by either side). Line numbers still come from
+    # find_blocks (tasks/hcl-parser-migration.md §4.3, §4.5).
+    _tree = parse_tf(text)[0] if is_tf_source(file_path) else None
+    _subtrees = resource_subtrees(_tree)
+    _regex_keys: dict[tuple, int] = {}
+    for _blk in resources:
+        _k = tuple(_blk["groups"])
+        _regex_keys[_k] = _regex_keys.get(_k, 0) + 1
+    for _blk in resources:
+        _k = tuple(_blk["groups"])
+        _found = _subtrees.get(_k, [])
+        _blk["attrs"] = (
+            normalise_attrs(_found[0])
+            if len(_found) == 1 and _regex_keys[_k] == 1 else None
+        )
     modules = find_blocks(text, MODULE_START)
     variables = find_blocks(text, VARIABLE_START)
 
-    for entry in entries:
-        eid = entry["id"]
-        for pat in entry.get("patterns", []) or []:
-            kind = pat.get("kind", "")
-            # Round 30.14 — registry dispatch. Every in-file detector
-            # kind is now a registered handler in `_INFILE_HANDLERS`.
-            # Unknown kinds (catalogue-only / corpus-only) fall through
-            # silently — `detect_corpus` handles its own kinds; truly
-            # malformed catalogue entries are caught at load time by
-            # `_catalog.validate_catalog_entry`.
-            _handler = _INFILE_HANDLERS.get(kind)
-            if _handler is None:
-                continue
-            _ctx = InFileCtx(
-                file_path=file_path,
-                text=text,
-                var_defaults=_vd,
-                resources=resources,
-                modules=modules,
-                variables=variables,
-                entry=entry,
-                eid=eid,
-                pat=pat,
-            )
-            findings.extend(_handler(_ctx))
+    with _pattern_budget_scope() as _budgeted:
+        for entry in entries:
+            eid = entry["id"]
+            for pat in entry.get("patterns", []) or []:
+                kind = pat.get("kind", "")
+                # Round 30.14 — registry dispatch. Every in-file detector
+                # kind is now a registered handler in `_INFILE_HANDLERS`.
+                # Unknown kinds (catalogue-only / corpus-only) fall through
+                # silently — `detect_corpus` handles its own kinds; truly
+                # malformed catalogue entries are caught at load time by
+                # `_catalog.validate_catalog_entry`.
+                _handler = _INFILE_HANDLERS.get(kind)
+                if _handler is None:
+                    continue
+                _ctx = InFileCtx(
+                    file_path=file_path,
+                    text=text,
+                    var_defaults=_vd,
+                    resources=resources,
+                    modules=modules,
+                    variables=variables,
+                    entry=entry,
+                    eid=eid,
+                    pat=pat,
+                    module_resources=module_resources,
+                )
+                _found = _call_with_budget(_handler, _ctx, eid, str(file_path), _budgeted)
+                _apply_structured_escalation(_found, entry, resources, _vd)
+                findings.extend(_found)
     return findings
 
 
@@ -728,33 +1006,34 @@ def detect_corpus(target: Path, all_files_text: dict, entries: list) -> list:
     _resource_index_cache: dict = _build_resource_index(all_files_text)
     _module_clusters_cache: dict = _build_module_clusters(all_files_text)
 
-    for entry in entries:
-        eid = entry["id"]
-        for pat in entry.get("patterns", []) or []:
-            kind = pat.get("kind", "")
-            # Round 30.14 — registry dispatch. Every corpus kind is
-            # now registered in `_CORPUS_HANDLERS`. Unknown kinds
-            # (in-file kinds or malformed catalogue entries) fall
-            # through; catalogue typos are caught at load time by
-            # `_catalog.validate_catalog_entry`.
-            _handler = _CORPUS_HANDLERS.get(kind)
-            if _handler is not None:
-                _ctx = CorpusCtx(
-                    target=target,
-                    all_files_text=all_files_text,
-                    sensitive_vars=sensitive_vars,
-                    module_dirs=module_dirs,
-                    var_refs_by_dir=var_refs_by_dir,
-                    output_refs=output_refs,
-                    module_sources=module_sources,
-                    resource_index_cache=_resource_index_cache,
-                    module_clusters_cache=_module_clusters_cache,
-                    entry=entry,
-                    eid=eid,
-                    pat=pat,
-                )
-                findings.extend(_handler(_ctx))
-                continue
+    with _pattern_budget_scope() as _budgeted:
+        for entry in entries:
+            eid = entry["id"]
+            for pat in entry.get("patterns", []) or []:
+                kind = pat.get("kind", "")
+                # Round 30.14 — registry dispatch. Every corpus kind is
+                # now registered in `_CORPUS_HANDLERS`. Unknown kinds
+                # (in-file kinds or malformed catalogue entries) fall
+                # through; catalogue typos are caught at load time by
+                # `_catalog.validate_catalog_entry`.
+                _handler = _CORPUS_HANDLERS.get(kind)
+                if _handler is not None:
+                    _ctx = CorpusCtx(
+                        target=target,
+                        all_files_text=all_files_text,
+                        sensitive_vars=sensitive_vars,
+                        module_dirs=module_dirs,
+                        var_refs_by_dir=var_refs_by_dir,
+                        output_refs=output_refs,
+                        module_sources=module_sources,
+                        resource_index_cache=_resource_index_cache,
+                        module_clusters_cache=_module_clusters_cache,
+                        entry=entry,
+                        eid=eid,
+                        pat=pat,
+                    )
+                    findings.extend(_call_with_budget(_handler, _ctx, eid, str(target), _budgeted))
+                    continue
     return findings
 
 
@@ -1043,6 +1322,8 @@ from _output import (
     _sarif_taxonomies,
     _sarif_rule_relationships,
     to_sarif,
+    sarif_source_root,
+    parse_fallback_notice,
     _narrative_for_finding,
     _render_executive_view,
     _disruption_badge,
@@ -1097,12 +1378,13 @@ def reprobe_finding(finding: dict, catalog_by_id: dict,
 
 
 def verify_fixed(prior_report: Path, target: Path, all_files_text: dict,
-                 entries: list[dict]) -> dict:
+                 entries: list[dict], unreadable_files: list[str] = ()) -> dict:
     """Adapter passing detect_in_file + detect_corpus to _verify."""
     return _verify_verify_fixed(
         prior_report, target, all_files_text, entries,
         detect_in_file=detect_in_file,
         detect_corpus=detect_corpus,
+        unreadable_files=unreadable_files,
     )
 
 
@@ -1135,8 +1417,14 @@ def load_suppressions(target: Path) -> tuple[dict, dict]:
 
 
 def load_inline_suppressions(text: str) -> dict[int, set[str]]:
-    """Public shim — passes detect.py's INLINE_IGNORE_RE to _baseline."""
-    return _baseline_load_inline_suppressions(text, inline_ignore_re=INLINE_IGNORE_RE)
+    """Public shim — passes detect.py's INLINE_IGNORE_RE to _baseline.
+
+    Only real comments count: the marker inside a string value (say a
+    ``description``) or a heredoc script would otherwise silence a
+    finding without looking like a suppression in review."""
+    return _baseline_load_inline_suppressions(
+        comments_only(text), inline_ignore_re=INLINE_IGNORE_RE,
+    )
 
 
 # ---- Catalog loading ----------------------------------------------------
@@ -1156,6 +1444,7 @@ from _scoring import (
     _URGENCY_TIERS,
     _grade_for_score,
     _compute_summary,
+    _scored_resource_count,
     explain_score,
     render_score_explanation,
 )
@@ -1190,6 +1479,7 @@ from _plan_state import (
     evaluate_against_resources as _evaluate_against_resources,
     detect_in_plan,
     detect_in_state,
+    PlanInputError,
 )
 
 
@@ -1393,14 +1683,17 @@ from _modes import (
 )
 
 
-def _fleet_scan(targets: list[Path], entries: list[dict]) -> dict:
-    """detect.py-side adapter passing the heavyweight scan callables."""
-    return _fleet_scan_raw(
-        targets, entries,
-        read_normalized=_read_normalized,
-        detect_corpus=detect_corpus,
-        detect_in_file=detect_in_file,
-    )
+def _fleet_scan(args: object, targets: list[Path], entries: list[dict]) -> dict:
+    """detect.py-side adapter: each target goes through `_scan_target`,
+    with its own `.tf-analyze.yaml` (or `--config`, or none with
+    `--no-project-config`)."""
+    def scan_one(target: Path) -> dict:
+        if args.no_project_config:
+            config = {}
+        else:
+            config = _load_project_config(Path(args.config).parent if args.config else target)
+        return _scan_target(args, target, entries, config, contain_symlinks=True)
+    return _fleet_scan_raw(targets, scan_one)
 
 
 def run_trend(target: Path, entries: list[dict], lookback_days: int) -> list[dict]:
@@ -1412,6 +1705,62 @@ def run_trend(target: Path, entries: list[dict], lookback_days: int) -> list[dic
 
 
 # ---- Feature 4: GitHub PR Review Mode ----------------------------------
+
+def _report_target(args: object) -> Path | None:
+    """The resolved scan target, recorded in JSON reports so a later
+    `--baseline` / `--compare` can pair findings by target-relative path
+    whatever directory the repo is checked out in."""
+    targets = getattr(args, "targets", None)
+    return Path(targets[0]).resolve() if targets else None
+
+
+def _gate_exit_code(
+    args: object, findings: list[dict], entries: list[dict],
+    parse_fallback_files: list[dict],
+    unreadable_files: list[str] = (),
+    rule_timeouts: list[dict] = (),
+) -> int:
+    """CI gate: 1 when a finding is at or above ``--fail-on``, when
+    ``--fail-on`` is set and an input file could not be read at all (a
+    scan that skipped a file has not passed it), or (with
+    ``--fail-on-parse-error``) a file could only be scanned in fallback
+    mode; else 0.
+
+    `findings` must be taken before INFO findings are hidden from output,
+    so ``--fail-on INFO`` sees them. A finding with no catalogue entry
+    (e.g. from ``--plan-json``) is gated on its own `urgency`.
+    """
+    if args.fail_on:
+        urgency_rank = {"CRITICAL": 1, "HIGH": 2, "MEDIUM": 3, "LOW": 4, "INFO": 5}
+        threshold = urgency_rank[args.fail_on]
+        entry_map = {e["id"]: e for e in entries}
+        for f in findings:
+            urgency = _effective_urgency(f, entry_map.get(f["id"], {}))
+            if urgency_rank.get(urgency, 3) <= threshold:
+                return 1
+        if unreadable_files:
+            print(
+                f"ERROR: {len(unreadable_files)} file(s) could not be read "
+                f"and were not scanned (--fail-on)",
+                file=sys.stderr,
+            )
+            return 1
+        if rule_timeouts:
+            print(
+                f"ERROR: {len(rule_timeouts)} rule check(s) ran out of time "
+                f"and were skipped (--fail-on)",
+                file=sys.stderr,
+            )
+            return 1
+    if args.fail_on_parse_error and parse_fallback_files:
+        print(
+            f"ERROR: {len(parse_fallback_files)} file(s) could not be parsed "
+            f"and were scanned in fallback mode (--fail-on-parse-error)",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
 
 def _pr_review_mode(args: object, findings: list[dict], entries: list[dict]) -> None:
     """Post findings as GitHub PR inline review comments.
@@ -1605,6 +1954,7 @@ def _check_module_registry_staleness(all_files_text: dict) -> list[dict]:
 # new module).
 from _cache import (
     corpus_hash as _corpus_hash,
+    default_cache_path as _default_cache_path,
     load_scan_cache as _load_scan_cache,
     save_scan_cache as _save_scan_cache,
 )
@@ -1636,17 +1986,34 @@ def _run_lsp_server(catalog_dir: Path, project_config: dict) -> None:
     """
     from _lsp import run_lsp_server as _lsp_run
 
-    def _scanner(path: Path, entries: list[dict]) -> list[dict]:
-        text = path.read_text()
+    def _scanner(path: Path, entries: list[dict], text: str | None) -> list[dict]:
+        # `text`: the editor's unsaved buffer, when the client sent one.
+        if text is None:
+            text = path.read_text()
         target_dir = path.parent
         all_files = {
             str(p): p.read_text()
             for p in target_dir.glob("*.tf") if p.exists()
         }
+        all_files[str(path)] = text
         var_defaults = _extract_var_defaults_by_dir(all_files)
-        return detect_in_file(
+        findings = detect_in_file(
             path, text, entries, var_defaults.get(str(target_dir), {}),
         )
+        # A file the HCL parser can't read is still scanned (regex
+        # fallback); tell the user once, as an Information diagnostic.
+        _parse_error = parse_tf(text)[1] if path.suffix == ".tf" else None
+        if _parse_error:
+            findings.append({
+                "id": "tf-analyze/parse-fallback",
+                "line": 1,
+                "lsp_severity": 3,
+                "lsp_message": (
+                    "tf-analyze: the HCL parser could not read this file; "
+                    f"scanned in fallback mode ({_parse_error})"
+                ),
+            })
+        return findings
 
     _lsp_run(
         catalog_dir, project_config,
@@ -1738,19 +2105,39 @@ def _mode_fleet(args: object, entries: list, emit, out_file) -> int:
     """Scan multiple repos and cross-correlate (`--mode fleet`).
 
     Extracted verbatim from main(). `emit`/`out_file` are main()'s report-output
-    sink and (optional) `--output` file handle. Returns an exit code.
+    sink and (optional) `--output` file handle. Returns an exit code: the
+    `--fail-on` gate over every target's findings, or 2 on bad input.
     """
+    if args.targets_file and not Path(args.targets_file).is_file():
+        print(f"ERROR: --targets-file not found: {args.targets_file}", file=sys.stderr)
+        return 2
+    # One plan / state file can't belong to every repo in the fleet; it
+    # used to be ignored silently.
+    if args.plan_json or args.state_json:
+        print("ERROR: --plan-json / --state-json are not supported with --mode fleet",
+              file=sys.stderr)
+        return 2
     fleet_targets = _resolve_fleet_targets(args)
     if not fleet_targets:
         print("ERROR: --mode fleet requires at least one --target or --targets-file", file=sys.stderr)
         return 2
-    fleet_result = _fleet_scan(fleet_targets, entries)
+    missing = [str(t) for t in fleet_targets if not Path(t).is_dir()]
+    if missing:
+        print(
+            f"ERROR: fleet target(s) not a directory: {', '.join(missing)}",
+            file=sys.stderr,
+        )
+        return 2
+    fleet_result = _fleet_scan(args, fleet_targets, entries)
     total = sum(fleet_result["summary"].values())
     print(f"# fleet: {len(fleet_targets)} repos, {total} total findings, {len(fleet_result['fleet_wide'])} fleet-wide", file=sys.stderr)
     emit(_render_fleet_report(fleet_result, args.format))
     if out_file is not None:
         out_file.close()
-    return 0
+    all_findings = [f for fs in fleet_result["by_target"].values() for f in fs]
+    return _gate_exit_code(args, all_findings, entries,
+                           fleet_result["parse_fallback_files"],
+                           fleet_result["unreadable_files"], RULE_TIMEOUTS)
 
 
 def _mode_trend(args: object, entries: list, emit, out_file) -> int:
@@ -1780,8 +2167,9 @@ def _mode_verify_fixed(args: object, entries: list, project_config: dict,
                        target: Path, reports_dir: Path, emit) -> int:
     """Re-probe a prior report's findings and classify fixed/still-present.
 
-    Extracted verbatim from main()'s `--mode verify-fixed` branch. Returns an
-    exit code.
+    Extracted from main()'s `--mode verify-fixed` branch. Returns an exit
+    code: the `--fail-on` gate over STILL-PRESENT and MOVED findings (and
+    unreadable files), or 2 when the prior report cannot be read.
     """
     prior = Path(args.prior_report) if args.prior_report else find_latest_prior(reports_dir, ".md")
     if not prior or not prior.exists():
@@ -1794,17 +2182,23 @@ def _mode_verify_fixed(args: object, entries: list, project_config: dict,
     # Load corpus for re-probing
     _ignore_paths_vf = project_config.get("ignore_paths") or []
     tf_files = [
-        p for p in target.rglob("*.tf")
+        p for p in tf_source_files(target)
         if ".terraform" not in p.parts
         and not _path_is_ignored(p, target, _ignore_paths_vf)
     ]
     all_text = {}
+    unreadable_files: list[str] = []
     for fp in tf_files:
         try:
-            all_text[fp] = _read_normalized(fp)
-        except Exception:
-            continue
-    verify = verify_fixed(prior, target, all_text, entries)
+            all_text[fp] = _read_tf_source(fp)
+        except Exception as e:
+            print(f"WARN: cannot read {fp}: {e}", file=sys.stderr)
+            unreadable_files.append(str(fp))
+    try:
+        verify = verify_fixed(prior, target, all_text, entries, unreadable_files)
+    except (OSError, ValueError) as e:
+        print(f"ERROR: cannot read prior report: {e}", file=sys.stderr)
+        return 2
     if args.format == "json":
         emit(json.dumps(verify, indent=2, default=str))
     else:
@@ -1815,7 +2209,11 @@ def _mode_verify_fixed(args: object, entries: list, project_config: dict,
         print(f"# wrote {out_path}")
         for state, rows in verify["results"].items():
             print(f"# {state}: {len(rows)}")
-    return 0
+    # Gate on what is still there (in place or moved) and on files that
+    # could not be re-checked. This mode always exited 0.
+    results = verify["results"]
+    still_open = results["STILL-PRESENT"] + results["MOVED"]
+    return _gate_exit_code(args, still_open, entries, [], unreadable_files)
 
 
 def _cmd_apply_fixes(args: object, findings: list, entries: list) -> bool:
@@ -1835,7 +2233,9 @@ def _cmd_apply_fixes(args: object, findings: list, entries: list) -> bool:
     if args.baseline:
         _baseline_path = Path(args.baseline)
         if _baseline_path.exists():
-            _retained, _suppressed_b = apply_baseline(findings, _baseline_path)
+            _retained, _suppressed_b = apply_baseline(
+                findings, _baseline_path, _report_target(args),
+            )
             if _suppressed_b:
                 print(
                     f"# apply-fixes: skipping {len(_suppressed_b)} baselined finding(s) "
@@ -1940,20 +2340,31 @@ def _make_emitter(args: object):
 
 
 def _run_detection(args: object, all_text: dict, extra_text: dict,
-                   entries: list, diff_files, target: Path) -> list:
+                   entries: list, diff_files, target: Path) -> tuple[list, list]:
     """Core scan: per-file + corpus detection over the loaded corpus, with the
     incremental cache, plus --plan-json and --state-json (drift) findings merged
-    in. Returns the findings list.
+    in. Returns ``(findings, parse_fallback_files)``: the second is one
+    ``{"file", "reason"}`` per scanned `.tf` file python-hcl2 could not parse
+    (scanned with the regex fallback instead; tasks/hcl-parser-migration.md
+    §4.8). It is cached alongside the findings.
 
     Extracted verbatim from main(). `entries` is the provider-filtered ruleset
     (main() runs that filter first, since downstream consumers reuse the same
     list). stderr-only side effects; no report output.
     """
     # Pass 2 — run per-file detection with the filtered ruleset.
-    # Build per-directory variable-default map once; passed into each
-    # detect_in_file call so plain `var.X` attribute values are resolved
-    # to their declared defaults before pattern matching.
-    var_defaults_by_dir = _extract_var_defaults_by_dir(all_text)
+    # Build the per-directory variable tables once; each detect_in_file
+    # call gets one so plain `var.X` / `local.X` attribute values are
+    # resolved before pattern matching. A child module with several
+    # callers has one table per caller (see _extract_var_contexts_by_dir).
+    var_contexts_by_dir = _extract_var_contexts_by_dir(all_text)
+    # Every resource block per directory (module), for sibling-resource
+    # checks across files (`unless_companion`).
+    module_resources_by_dir: dict[str, list[dict]] = {}
+    for _fp, _text in all_text.items():
+        module_resources_by_dir.setdefault(str(_fp.parent), []).extend(
+            find_blocks(_text, RESOURCE_START)
+        )
 
     # Incremental cache: if --cache is set and the corpus hash matches the
     # stored cache, return the cached findings immediately (skipping the full
@@ -1962,6 +2373,10 @@ def _run_detection(args: object, all_text: dict, extra_text: dict,
     _corpus_hash_val: str | None = None
     _cache_hit = False
     findings: list[dict] = []
+    # ids of --plan-json / --state-json findings: they come from inputs
+    # the corpus hash does not cover, so they are never cached.
+    external_ids: set[int] = set()
+    parse_fallback_files: list[dict] = []
     if getattr(args, "cache", False) and diff_files is None:
         # Hash the FULL scanned-file set (.tf + the extra workflow-YAML /
         # tfvars files scanned below), not just .tf. The extra_text scan
@@ -1972,22 +2387,33 @@ def _run_detection(args: object, all_text: dict, extra_text: dict,
         _cache_path = (
             Path(args.cache_file).resolve()
             if getattr(args, "cache_file", None)
-            else target / ".tf-analyze-cache.json"
+            else _default_cache_path(target)
         )
         _cached = _load_scan_cache(_cache_path)
         if _cached and _cached.get("corpus_hash") == _corpus_hash_val:
             print("# cache hit — skipping full scan", file=sys.stderr)
             findings = _cached.get("findings", [])
+            parse_fallback_files = _cached.get("parse_fallback_files", [])
             _cache_hit = True
 
     if not _cache_hit:
         for fp, text in all_text.items():
             if diff_files is not None and fp not in diff_files:
                 continue
-            findings.extend(
-                detect_in_file(fp, text, entries,
-                               var_defaults=var_defaults_by_dir.get(str(fp.parent), {}))
-            )
+            seen: set[tuple] = set()
+            for var_defaults in var_contexts_by_dir.get(str(fp.parent)) or [{}]:
+                for f in detect_in_file(
+                    fp, text, entries, var_defaults=var_defaults,
+                    module_resources=module_resources_by_dir.get(str(fp.parent)),
+                ):
+                    key = (f.get("id"), f.get("line"), f.get("resource"))
+                    if key not in seen:
+                        seen.add(key)
+                        findings.append(f)
+            # parse_tf is memoised, so this re-reads detect_in_file's result.
+            _parse_error = parse_tf(text)[1]
+            if _parse_error:
+                parse_fallback_files.append({"file": str(fp), "reason": _parse_error})
         # Run grep-style rules against workflow YAML / tfvars / any
         # other non-tf file_glob (--mode diff intentionally skips these
         # since they are not in the git diff of *.tf files).
@@ -2006,7 +2432,12 @@ def _run_detection(args: object, all_text: dict, extra_text: dict,
                 file=sys.stderr,
             )
             sys.exit(2)
-        plan_findings = detect_in_plan(plan_path, entries)
+        try:
+            plan_findings = detect_in_plan(plan_path, entries)
+        except PlanInputError as e:
+            # Exit like a missing file: no findings is not a pass.
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(2)
         if plan_findings:
             print(
                 f"# {len(plan_findings)} plan-time finding(s) from "
@@ -2014,6 +2445,7 @@ def _run_detection(args: object, all_text: dict, extra_text: dict,
                 file=sys.stderr,
             )
         findings.extend(plan_findings)
+        external_ids.update(id(f) for f in plan_findings)
 
     # Drift mode — re-evaluate rules against `terraform show -json
     # state.tfstate` output. R30.12 — closes the gap between HCL intent
@@ -2037,7 +2469,12 @@ def _run_detection(args: object, all_text: dict, extra_text: dict,
                 file=sys.stderr,
             )
             sys.exit(2)
-        state_findings = detect_in_state(state_path, entries)
+        try:
+            state_findings = detect_in_state(state_path, entries)
+        except PlanInputError as e:
+            # Exit like a missing file: no findings is not a pass.
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(2)
         if state_findings:
             print(
                 f"# {len(state_findings)} drift finding(s) from "
@@ -2045,6 +2482,7 @@ def _run_detection(args: object, all_text: dict, extra_text: dict,
                 file=sys.stderr,
             )
         findings.extend(state_findings)
+        external_ids.update(id(f) for f in state_findings)
 
     # Corpus-level checks run against all files (even in diff mode)
     if not _cache_hit:
@@ -2057,12 +2495,217 @@ def _run_detection(args: object, all_text: dict, extra_text: dict,
             ]
         findings.extend(corpus_findings)
 
-        # Persist to cache after all per-file + corpus findings are collected
-        # (before plan / registry findings which require external inputs).
-        if _cache_path and _corpus_hash_val:
-            _save_scan_cache(_cache_path, _corpus_hash_val, findings)
+        # Persist the per-file + corpus findings only: plan / state
+        # findings depend on external inputs, and a later run without them
+        # would otherwise replay them from the cache.
+        # Not when a rule check timed out: the result is incomplete.
+        if _cache_path and _corpus_hash_val and not RULE_TIMEOUTS:
+            _save_scan_cache(_cache_path, _corpus_hash_val,
+                             [f for f in findings if id(f) not in external_ids],
+                             parse_fallback_files=parse_fallback_files)
 
-    return findings
+    return findings, parse_fallback_files
+
+
+def _scan_target(args: object, target: Path, entries: list, project_config: dict,
+                 diff_files=None, *, contain_symlinks: bool = False) -> dict:
+    """One target through the static pipeline: read the files, filter rules
+    by `applies_when`, detect (with variable resolution), then apply
+    `ignore_rules`, de-duplication and inline / `.tf-analyze-ignore.yaml`
+    suppressions. Exits 2 when `--fail-on` is set and no Terraform is found.
+
+    Shared by the static scan and `--mode fleet`. Fleet had its own copy
+    that skipped suppressions, `ignore_rules` / `ignore_paths`,
+    `applies_when`, variable resolution and parse-fallback tracking, so a
+    finding suppressed in a static scan still failed a fleet gate.
+    `contain_symlinks` (fleet) skips files that resolve outside `target`.
+
+    Returns `findings`, `suppressed_findings`, `parse_fallback_files`,
+    `unreadable_files`, `all_text`, `tf_files` and the rule-filtered `entries`.
+    """
+    # Load suppressions. expired_suppressions is shown in the report so
+    # findings that just lost their cover are visible as "expired
+    # suppression" rather than buried under "new findings".
+    global_suppressions: dict = {}
+    expired_suppressions: dict = {}
+    if not args.no_suppress:
+        global_suppressions, expired_suppressions = load_suppressions(target)
+        if expired_suppressions:
+            print(
+                f"# {len(expired_suppressions)} suppression(s) expired; "
+                f"affected findings will be tagged in the report",
+                file=sys.stderr,
+            )
+
+    _ignore_paths = project_config.get("ignore_paths") or []
+    _root = target.resolve()
+    tf_files = [
+        p for p in tf_source_files(target)
+        if ".terraform" not in p.parts
+        and not _path_is_ignored(p, target, _ignore_paths)
+        # fleet targets may be untrusted repos: never follow a symlink out
+        and (not contain_symlinks or p.resolve().is_relative_to(_root))
+    ]
+    if not tf_files:
+        # A gated scan that checked no Terraform is a misconfigured CI job
+        # (wrong folder, or ignore_paths excluding everything), not a pass:
+        # it used to score 100 and exit 0. Plan / state input is a real
+        # scan without .tf files. Diff mode is unaffected: tf_files is the
+        # whole target here, so a PR that changes no Terraform still passes.
+        if args.fail_on and not args.plan_json and not args.state_json:
+            why = " after ignore_paths" if _ignore_paths else ""
+            print(
+                f"ERROR: no .tf / .tf.json files found under {target}{why}; "
+                f"nothing was checked (--fail-on)",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        print(f"WARN: no .tf / .tf.json files found under {target}", file=sys.stderr)
+    if _ignore_paths:
+        print(
+            f"# ignore_paths active: skipping {', '.join(map(str, _ignore_paths))}",
+            file=sys.stderr,
+        )
+    # Workflow-YAML walker — pick up `.github/workflows/*.yml`, `*.tfvars`,
+    # and any other non-tf file_glob declared in the catalogue so the
+    # CICD rules (SEC-CICD-001/002/003) actually fire. The Terraform
+    # rules still filter by `file_path.match(file_glob)` inside
+    # `detect_in_file`, so adding workflow YAMLs to the corpus does not
+    # cross-contaminate tf rules.
+    extra_files = _collect_extra_files(target, entries, ignore_paths=_ignore_paths)
+
+    # Pass 1 — load every file so we can compute provider constraints
+    # before deciding which rules apply. Inline suppressions are also
+    # collected here so we don't have to re-read text in pass 2.
+    all_text = {}
+    file_inline_suppressions: dict[str, dict[int, set[str]]] = {}
+    unreadable_files: list[str] = []
+    for fp in tf_files:
+        try:
+            text = _read_tf_source(fp)
+        except Exception as e:
+            print(f"WARN: cannot read {fp}: {e}", file=sys.stderr)
+            unreadable_files.append(str(fp))
+            continue
+        all_text[fp] = text
+        # JSON has no comments: a `# tf-analyze:ignore` in rendered
+        # `.tf.json` text could only come from a string value (and sits in
+        # rendered-line space, not the JSON lines findings are reported
+        # in). Those files are suppressed via project/global config only.
+        if not args.no_suppress and not is_tf_json(fp):
+            file_inline_suppressions[str(fp)] = load_inline_suppressions(text)
+
+    # Extra files (workflow YAML, tfvars, etc.) — read with the same
+    # normaliser, but never used for provider-constraint detection.
+    extra_text: dict = {}
+    for fp in extra_files:
+        try:
+            extra_text[fp] = _read_normalized(fp)
+        except Exception as e:
+            print(f"WARN: cannot read {fp}: {e}", file=sys.stderr)
+            unreadable_files.append(str(fp))
+
+    # Provider/Terraform-version-aware filter: entries with `applies_when`
+    # are skipped when the target's required_providers / required_version
+    # constraint cannot reach the minimum version. Surface the skip count
+    # so users know rules are conditionally off rather than silently
+    # disabled.
+    provider_constraints = _extract_provider_constraints(all_text)
+    tf_constraint = _extract_terraform_version(all_text)
+    pre_filter = len(entries)
+    entries = [
+        e for e in entries
+        if _entry_applies_to_providers(e, provider_constraints, tf_constraint)
+    ]
+    skipped = pre_filter - len(entries)
+    if skipped:
+        print(
+            f"# {skipped} rule(s) skipped due to applies_when "
+            f"provider/terraform-version constraints",
+            file=sys.stderr,
+        )
+
+    # Pass 2 — per-file + corpus detection (with the incremental cache),
+    # plus --plan-json and --state-json (drift) findings merged in.
+    # See _run_detection. `entries` is already provider-filtered above.
+    findings, parse_fallback_files = _run_detection(
+        args, all_text, extra_text, entries, diff_files, target,
+    )
+    remap_lines(findings)
+    for _pf in parse_fallback_files:
+        print(
+            f"WARN: {_pf['file']}: parse failed, scanned in fallback mode: "
+            f"{_pf['reason']}",
+            file=sys.stderr,
+        )
+
+    # Registry staleness check (opt-in; requires network access).
+    # Audit item 15 — direct attribute access; argparse boolean-flag
+    # always defaults to False so a typo would crash here instead of
+    # silently disabling the check.
+    if args.check_registry:
+        registry_findings = _check_module_registry_staleness(all_text)
+        print(
+            f"# registry check: {len(registry_findings)} stale module(s) found",
+            file=sys.stderr,
+        )
+        findings.extend(registry_findings)
+
+    # Apply project-wide ignore_rules from .tf-analyze.yaml
+    _ignore_rules = project_config.get("ignore_rules") or []
+    if _ignore_rules:
+        _ignore_set = set(_ignore_rules)
+        _before = len(findings)
+        findings = [f for f in findings if f["id"] not in _ignore_set]
+        _ignored = _before - len(findings)
+        if _ignored:
+            print(f"# {_ignored} finding(s) suppressed by project ignore_rules", file=sys.stderr)
+
+    # De-duplicate exact-duplicate findings — a whole-file grep rule or
+    # overlapping detection passes could emit the same (id, file, line,
+    # resource) twice; collapse them so counts/score and every output
+    # format see each finding once. Order-preserving.
+    _seen_fp: set = set()
+    _deduped: list[dict] = []
+    for _f in findings:
+        _fp = (_f.get("id"), _f.get("file"), _f.get("line"), _f.get("resource"))
+        if _fp in _seen_fp:
+            continue
+        _seen_fp.add(_fp)
+        _deduped.append(_f)
+    if len(_deduped) != len(findings):
+        print(
+            f"# {len(findings) - len(_deduped)} duplicate finding(s) collapsed",
+            file=sys.stderr,
+        )
+    findings = _deduped
+
+    # Apply suppressions
+    suppressed_findings: list[dict] = []
+    if not args.no_suppress and (global_suppressions or file_inline_suppressions):
+        findings, suppressed_findings = apply_suppressions(
+            findings, file_inline_suppressions, global_suppressions
+        )
+        if suppressed_findings:
+            print(f"# {len(suppressed_findings)} finding(s) suppressed", file=sys.stderr)
+    # Tag findings whose suppression just expired so the report can show
+    # them in a dedicated section instead of mislabelling them as "new".
+    if expired_suppressions:
+        for f in findings:
+            entry = expired_suppressions.get(f["id"])
+            if entry:
+                f["was_suppressed_until"] = entry.get("expires")
+                f["prior_suppression_reason"] = entry.get("reason", "")
+
+    return {
+        "findings": findings,
+        "suppressed_findings": suppressed_findings,
+        "parse_fallback_files": parse_fallback_files,
+        "unreadable_files": unreadable_files,
+        "all_text": all_text,
+        "tf_files": tf_files,
+        "entries": entries,
+    }
 
 
 def _render_report(args: object, findings: list, entries: list, *, emit,
@@ -2080,11 +2723,13 @@ def _render_report(args: object, findings: list, entries: list, *, emit,
     _emit = emit
     # Report comparison
     if compare_target:
-        delta = compare_reports(findings, Path(compare_target))
+        delta = compare_reports(findings, Path(compare_target), _report_target(args))
         print(f"# delta: {len(delta['new'])} new, {len(delta['resolved'])} resolved, "
               f"{len(delta['unchanged'])} unchanged", file=sys.stderr)
         if args.format == "json":
             output = {
+                "tool_version": __version__,
+                "target": str(_report_target(args) or ""),
                 "summary": summary,
                 "findings": findings,
                 "suppressed": suppressed_findings,
@@ -2098,7 +2743,14 @@ def _render_report(args: object, findings: list, entries: list, *, emit,
                 output["score_explanation"] = explain_score(findings, summary)
             _emit(json.dumps(output, indent=2))
         elif args.format == "sarif":
-            sarif = to_sarif(findings, entries)
+            sarif = to_sarif(
+                findings, entries,
+                parse_fallback_files=summary.get("parse_fallback_files"),
+                source_root=(
+                    sarif_source_root(Path(args.targets[0]))
+                    if args.targets else None
+                ),
+            )
             _emit(json.dumps(sarif, indent=2))
         elif args.format == "html":
             _emit(to_html(findings, entries, suppressed_findings, graph=attack_graph, show_fixes=getattr(args, "show_fixes", False), centrality=centrality_scores, compliance_data=compliance_report, summary=summary))
@@ -2127,6 +2779,8 @@ def _render_report(args: object, findings: list, entries: list, *, emit,
                 + (f" · {summary['suppressed_count']} suppressed"
                    if summary["suppressed_count"] else "")
             )
+            if parse_fallback_notice(summary):
+                _emit(f"# {parse_fallback_notice(summary)}")
             if delta["new"]:
                 _emit("# NEW findings:")
                 for f in delta["new"]:
@@ -2158,7 +2812,12 @@ def _render_report(args: object, findings: list, entries: list, *, emit,
 
         # Standard output
         if args.format == "json":
-            output_data: dict = {"summary": summary, "findings": findings}
+            output_data: dict = {
+                "tool_version": __version__,
+                "target": str(_report_target(args) or ""),
+                "summary": summary,
+                "findings": findings,
+            }
             if suppressed_findings:
                 output_data["suppressed"] = suppressed_findings
             if suppressed_by_baseline:
@@ -2171,7 +2830,14 @@ def _render_report(args: object, findings: list, entries: list, *, emit,
                 output_data["score_explanation"] = score_explanation
             _emit(json.dumps(output_data, indent=2))
         elif args.format == "sarif":
-            sarif = to_sarif(findings, entries)
+            sarif = to_sarif(
+                findings, entries,
+                parse_fallback_files=summary.get("parse_fallback_files"),
+                source_root=(
+                    sarif_source_root(Path(args.targets[0]))
+                    if args.targets else None
+                ),
+            )
             _emit(json.dumps(sarif, indent=2))
         elif args.format == "html":
             _emit(to_html(findings, entries, suppressed_findings, graph=attack_graph, show_fixes=getattr(args, "show_fixes", False), centrality=centrality_scores, compliance_data=compliance_report, summary=summary))
@@ -2203,6 +2869,8 @@ def _render_report(args: object, findings: list, entries: list, *, emit,
                 + (f" · {summary['suppressed_count']} suppressed"
                    if summary["suppressed_count"] else "")
             )
+            if parse_fallback_notice(summary):
+                _emit(f"# {parse_fallback_notice(summary)}")
             if score_explanation:
                 _emit("")
                 _emit(render_score_explanation(score_explanation))
@@ -2283,6 +2951,16 @@ def _add_target_args(ap: argparse.ArgumentParser) -> None:
         help=(
             "Path to .tf-analyze.yaml project config file. "
             "Default: auto-discover in target directory."
+        ),
+    )
+    ap.add_argument(
+        "--no-project-config",
+        action="store_true",
+        help=(
+            "Ignore .tf-analyze.yaml. In CI on untrusted pull requests the "
+            "scanned repo controls that file, and its ignore_rules / "
+            "ignore_paths / rules_dir can switch the gate off; pair with "
+            "--no-suppress for the ignore file and inline comments."
         ),
     )
 
@@ -2405,7 +3083,20 @@ def _add_output_args(ap: argparse.ArgumentParser) -> None:
         "--fail-on",
         default=None,
         choices=["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"],
-        help="Exit with code 1 if any finding at this urgency or above exists",
+        help=(
+            "Exit with code 1 if any finding at this urgency or above exists, "
+            "or if a file could not be read or a rule check ran out of time. "
+            "Exit with code 2 if no .tf / .tf.json files were found to scan "
+            "(unless --plan-json or --state-json supplies the input)"
+        ),
+    )
+    ap.add_argument(
+        "--fail-on-parse-error",
+        action="store_true",
+        help=(
+            "Exit with code 1 if any .tf file could not be parsed and was "
+            "scanned in the less precise regex fallback mode"
+        ),
     )
     # Suppressions are on by default; --no-suppress is the opt-out toggle.
     # An earlier `--suppress` flag was a confusing no-op (it defaulted to
@@ -2448,7 +3139,7 @@ def _add_mode_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument(
         "--diff-base",
         default=None,
-        help="Git ref to diff against (e.g., main). Only scan changed .tf files.",
+        help="Git ref to diff against (e.g., main). Only scan changed .tf / .tf.json files.",
     )
     ap.add_argument(
         "--state-json",
@@ -2671,7 +3362,9 @@ def _add_comparison_args(ap: argparse.ArgumentParser) -> None:
             "Path to a baseline JSON report. Findings present in the baseline "
             "are suppressed (counted under `suppressed_by_baseline` in JSON "
             "output) so only NEW findings affect the exit code. "
-            "Match key: (id, file, line, resource). Use to ratchet a legacy "
+            "Findings match by rule, file (relative to the target) and "
+            "resource — not the line, so code moving or a different checkout "
+            "folder doesn't make a known finding new. Use to ratchet a legacy "
             "repo: snapshot today's findings, then enforce no regressions "
             "going forward."
         ),
@@ -2679,8 +3372,10 @@ def _add_comparison_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument(
         "--prior-report",
         default=None,
-        help="Markdown report to verify (for --mode verify-fixed). "
-             "If omitted, picks the most recent tf-analysis-*.md under reports/.",
+        help="Report to verify (for --mode verify-fixed): a markdown report, or "
+             "this CLI's --format json / text output. If omitted, picks the most "
+             "recent tf-analysis-*.md under reports/. Exits 1 under --fail-on when "
+             "a STILL-PRESENT or MOVED finding meets the threshold.",
     )
     ap.add_argument(
         "--reports-dir",
@@ -2704,7 +3399,8 @@ def _add_cache_args(ap: argparse.ArgumentParser) -> None:
         help=(
             "Enable incremental scan caching. Stores findings keyed on a "
             "hash of all .tf file contents + catalogue entries in "
-            ".tf-analyze-cache.json inside the target directory. "
+            "a per-target file under the user cache dir (never inside the "
+            "target, so a committed cache file cannot replay findings). "
             "Subsequent runs on unchanged code return the cached findings "
             "instantly. Cache is invalidated automatically when any .tf file "
             "or catalogue rule changes. Use --cache-file to override the path."
@@ -2714,7 +3410,7 @@ def _add_cache_args(ap: argparse.ArgumentParser) -> None:
         "--cache-file",
         default=None,
         metavar="PATH",
-        help="Override the cache file path used by --cache (default: <target>/.tf-analyze-cache.json).",
+        help="Override the cache file path used by --cache (default: a per-target file under the user cache dir).",
     )
 
 
@@ -2731,7 +3427,9 @@ def _add_fix_args(ap: argparse.ArgumentParser) -> None:
             "'apply' writes the patched files to disk (creates .bak backups). "
             "Only resource_missing_arg and resource_arg/hcl_attr patterns are "
             "patched; patterns without fix_hcl are skipped. "
-            "Always review dry-run output before applying."
+            "Always review dry-run output before applying. "
+            "'apply' exits 0 after patching and does not apply --fail-on: "
+            "re-run the scan to gate on what is left."
         ),
     )
     ap.add_argument(
@@ -2764,28 +3462,33 @@ def _add_fix_args(ap: argparse.ArgumentParser) -> None:
     )
 
 
+# Parser-selection switches removed by the parser migration. Accepted as
+# hidden no-ops for one minor release so existing pipelines (the GitHub
+# Action defaults to the `:latest` image) don't break; see
+# tasks/hcl-parser-migration.md §7.
+_DEPRECATED_PARSER_FLAGS = ("--use-hcl2", "--no-hcl2")
+_DEPRECATED_PARSER_ENV = ("TF_ANALYZE_USE_HCL2", "TF_ANALYZE_NO_HCL2")
+
+
 def _add_engine_args(ap: argparse.ArgumentParser) -> None:
-    """Parser-engine selection (python-hcl2 fast-path vs regex)."""
-    ap.add_argument(
-        "--use-hcl2",
-        action="store_true",
-        default=os.environ.get("TF_ANALYZE_USE_HCL2") == "1",
-        help=(
-            "[deprecated, default-on since v0.2] Enable python-hcl2 "
-            "fast-path. Kept for backwards compat; behaviour is now "
-            "controlled by --no-hcl2."
-        ),
-    )
-    ap.add_argument(
-        "--no-hcl2",
-        action="store_true",
-        default=os.environ.get("TF_ANALYZE_NO_HCL2") == "1",
-        help=(
-            "Disable the python-hcl2 fast-path and use the regex parser "
-            "exclusively. Useful for benchmarking or when running in a "
-            "constrained environment without the optional dependency."
-        ),
-    )
+    """Deprecated parser-engine switches (now no-ops)."""
+    for flag in _DEPRECATED_PARSER_FLAGS:
+        ap.add_argument(flag, action="store_true", help=argparse.SUPPRESS)
+
+
+def _warn_deprecated_parser_switches(args: argparse.Namespace) -> None:
+    """One stderr line per deprecated switch in use. They have no effect:
+    the vendored python-hcl2 parser is always used."""
+    used = [f for f in _DEPRECATED_PARSER_FLAGS
+            if getattr(args, f.lstrip("-").replace("-", "_"))]
+    used += [v for v in _DEPRECATED_PARSER_ENV if v in os.environ]
+    for name in used:
+        print(
+            f"NOTE: {name} is deprecated and has no effect; tf-analyze "
+            "always uses its bundled HCL parser. It will be removed in the "
+            "next minor release.",
+            file=sys.stderr,
+        )
 
 
 def _add_lsp_args(ap: argparse.ArgumentParser) -> None:
@@ -2822,6 +3525,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser-spec snapshot guards against drift).
     """
     ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--version", action="version", version=f"tf-analyze {__version__}",
+        help="Print the tf-analyze version and exit",
+    )
     _add_target_args(ap)
     _add_catalog_args(ap)
     _add_output_args(ap)
@@ -2840,21 +3547,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def main():
     ap = _build_parser()
     args = ap.parse_args()
-    # python-hcl2 fast-path is on by default; `--no-hcl2` (or
-    # TF_ANALYZE_NO_HCL2=1) restores the stdlib-only regex path.  When
-    # python-hcl2 isn't installed we silently fall back, but emit a
-    # one-line stderr notice the first time so the user knows they're
-    # missing the heredoc-aware parser.
-    if not args.no_hcl2:
-        if _HAS_HCL2:
-            _enable_hcl2_default()
-        else:
-            print(
-                "NOTE: python-hcl2 not installed; using regex parser. "
-                "`pip install python-hcl2` removes a class of false positives "
-                "around heredoc/multi-line attributes. (Pass --no-hcl2 to silence.)",
-                file=sys.stderr,
-            )
+    _warn_deprecated_parser_switches(args)
 
     # Route report output: stdout (default) or a file (--output PATH).
     # See _make_emitter for the atexit safety-net rationale.
@@ -2877,7 +3570,10 @@ def main():
         _project_config_target = Path(args.targets[0]).resolve()
     else:
         _project_config_target = Path.cwd()
-    project_config = _load_project_config(_project_config_target)
+    project_config = (
+        {} if args.no_project_config
+        else _load_project_config(_project_config_target)
+    )
 
     # Resolve extra_rules_dir from project config
     _extra_rules_dir: Path | None = None
@@ -2937,7 +3633,24 @@ def main():
     if args.mode == "trend":
         sys.exit(_mode_trend(args, entries, _emit, _out_file))
 
+    if len(args.targets) > 1:
+        print(
+            "ERROR: more than one --target given; only --mode fleet scans "
+            "several targets",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     target = Path(args.targets[0]).resolve()
+    # A missing or mistyped target must not scan nothing and pass a CI
+    # gate with grade A.
+    if not target.is_dir():
+        problem = "does not exist" if not target.exists() else "is not a directory"
+        print(
+            f"ERROR: --target {args.targets[0]!r} {problem} "
+            f"(pass the directory that holds the .tf files)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     # Reports directory — used for auto-compare and verify-fixed discovery
     reports_dir = (
@@ -2955,156 +3668,36 @@ def main():
     if args.diff_base or args.mode == "diff":
         base = args.diff_base or _auto_detect_base_branch(target)
         diff_files = get_diff_files(target, base)
-        if not diff_files:
-            print("# no changed .tf files in diff", file=sys.stderr)
-
-    # Load suppressions. expired_suppressions is shown in the report so
-    # findings that just lost their cover are visible as "expired
-    # suppression" rather than buried under "new findings".
-    global_suppressions: dict = {}
-    expired_suppressions: dict = {}
-    if not args.no_suppress:
-        global_suppressions, expired_suppressions = load_suppressions(target)
-        if expired_suppressions:
+        if diff_files is None:
+            # The diff itself failed: scanning "no changed files" would
+            # pass the gate having checked nothing. Scan everything.
             print(
-                f"# {len(expired_suppressions)} suppression(s) expired; "
-                f"affected findings will be tagged in the report",
+                f"WARN: could not diff against {base!r}; scanning all files",
                 file=sys.stderr,
             )
+        elif not diff_files:
+            print("# no changed .tf / .tf.json files in diff", file=sys.stderr)
 
-    _ignore_paths = project_config.get("ignore_paths") or []
-    tf_files = [
-        p for p in target.rglob("*.tf")
-        if ".terraform" not in p.parts
-        and not _path_is_ignored(p, target, _ignore_paths)
-    ]
-    if _ignore_paths:
-        print(
-            f"# ignore_paths active: skipping {', '.join(map(str, _ignore_paths))}",
-            file=sys.stderr,
-        )
-    # Workflow-YAML walker — pick up `.github/workflows/*.yml`, `*.tfvars`,
-    # and any other non-tf file_glob declared in the catalogue so the
-    # CICD rules (SEC-CICD-001/002/003) actually fire. The Terraform
-    # rules still filter by `file_path.match(file_glob)` inside
-    # `detect_in_file`, so adding workflow YAMLs to the corpus does not
-    # cross-contaminate tf rules.
-    extra_files = _collect_extra_files(target, entries, ignore_paths=_ignore_paths)
+    # Read, detect, filter and suppress — see _scan_target (shared with
+    # --mode fleet so the two cannot drift apart again).
+    _scan = _scan_target(args, target, entries, project_config, diff_files)
+    findings = _scan["findings"]
+    suppressed_findings = _scan["suppressed_findings"]
+    parse_fallback_files = _scan["parse_fallback_files"]
+    unreadable_files = _scan["unreadable_files"]
+    all_text = _scan["all_text"]
+    tf_files = _scan["tf_files"]
+    entries = _scan["entries"]
 
-    # Pass 1 — load every file so we can compute provider constraints
-    # before deciding which rules apply. Inline suppressions are also
-    # collected here so we don't have to re-read text in pass 2.
-    all_text = {}
-    file_inline_suppressions: dict[str, dict[int, set[str]]] = {}
-    for fp in tf_files:
-        try:
-            text = _read_normalized(fp)
-        except Exception as e:
-            print(f"WARN: cannot read {fp}: {e}", file=sys.stderr)
-            continue
-        all_text[fp] = text
-        if not args.no_suppress:
-            file_inline_suppressions[str(fp)] = load_inline_suppressions(text)
-
-    # Extra files (workflow YAML, tfvars, etc.) — read with the same
-    # normaliser, but never used for provider-constraint detection.
-    extra_text: dict = {}
-    for fp in extra_files:
-        try:
-            extra_text[fp] = _read_normalized(fp)
-        except Exception as e:
-            print(f"WARN: cannot read {fp}: {e}", file=sys.stderr)
-
-    # Provider/Terraform-version-aware filter: entries with `applies_when`
-    # are skipped when the target's required_providers / required_version
-    # constraint cannot reach the minimum version. Surface the skip count
-    # so users know rules are conditionally off rather than silently
-    # disabled.
-    provider_constraints = _extract_provider_constraints(all_text)
-    tf_constraint = _extract_terraform_version(all_text)
-    pre_filter = len(entries)
-    entries = [
-        e for e in entries
-        if _entry_applies_to_providers(e, provider_constraints, tf_constraint)
-    ]
-    skipped = pre_filter - len(entries)
-    if skipped:
-        print(
-            f"# {skipped} rule(s) skipped due to applies_when "
-            f"provider/terraform-version constraints",
-            file=sys.stderr,
-        )
-
-    # Pass 2 — per-file + corpus detection (with the incremental cache),
-    # plus --plan-json and --state-json (drift) findings merged in.
-    # See _run_detection. `entries` is already provider-filtered above.
-    findings = _run_detection(args, all_text, extra_text, entries, diff_files, target)
-
-    # Registry staleness check (opt-in; requires network access).
-    # Audit item 15 — direct attribute access; argparse boolean-flag
-    # always defaults to False so a typo would crash here instead of
-    # silently disabling the check.
-    if args.check_registry:
-        registry_findings = _check_module_registry_staleness(all_text)
-        print(
-            f"# registry check: {len(registry_findings)} stale module(s) found",
-            file=sys.stderr,
-        )
-        findings.extend(registry_findings)
-
-    # Auto-fix application — runs before suppression so the patched file
-    # re-scan (if the user re-runs) won't report those findings.
+    # Auto-fix application — after project `ignore_rules` and inline /
+    # `.tf-analyze-ignore.yaml` suppressions, so a finding the user has
+    # suppressed (e.g. "this database cannot be replaced") is never
+    # patched. It used to run first and patched everything.
     # Audit item 15 — direct access on argparse-wired flags.
     if args.apply_fixes:
         # Exit after a real apply so the user can re-run to confirm clean state.
         if _cmd_apply_fixes(args, findings, entries):
             return
-
-    # Apply project-wide ignore_rules from .tf-analyze.yaml
-    _ignore_rules = project_config.get("ignore_rules") or []
-    if _ignore_rules:
-        _ignore_set = set(_ignore_rules)
-        _before = len(findings)
-        findings = [f for f in findings if f["id"] not in _ignore_set]
-        _ignored = _before - len(findings)
-        if _ignored:
-            print(f"# {_ignored} finding(s) suppressed by project ignore_rules", file=sys.stderr)
-
-    # De-duplicate exact-duplicate findings — a whole-file grep rule or
-    # overlapping detection passes could emit the same (id, file, line,
-    # resource) twice; collapse them so counts/score and every output
-    # format see each finding once. Order-preserving.
-    _seen_fp: set = set()
-    _deduped: list[dict] = []
-    for _f in findings:
-        _fp = (_f.get("id"), _f.get("file"), _f.get("line"), _f.get("resource"))
-        if _fp in _seen_fp:
-            continue
-        _seen_fp.add(_fp)
-        _deduped.append(_f)
-    if len(_deduped) != len(findings):
-        print(
-            f"# {len(findings) - len(_deduped)} duplicate finding(s) collapsed",
-            file=sys.stderr,
-        )
-    findings = _deduped
-
-    # Apply suppressions
-    suppressed_findings: list[dict] = []
-    if not args.no_suppress and (global_suppressions or file_inline_suppressions):
-        findings, suppressed_findings = apply_suppressions(
-            findings, file_inline_suppressions, global_suppressions
-        )
-        if suppressed_findings:
-            print(f"# {len(suppressed_findings)} finding(s) suppressed", file=sys.stderr)
-    # Tag findings whose suppression just expired so the report can show
-    # them in a dedicated section instead of mislabelling them as "new".
-    if expired_suppressions:
-        for f in findings:
-            entry = expired_suppressions.get(f["id"])
-            if entry:
-                f["was_suppressed_until"] = entry.get("expires")
-                f["prior_suppression_reason"] = entry.get("reason", "")
 
     # Auto-stub generation — scaffold YAML files for either:
     #   (a) IDs explicitly passed via --propose-stub (judgement-pass promotion)
@@ -3233,13 +3826,6 @@ def main():
                 )
                 sys.exit(2)
 
-    # PR review mode — post inline comments and exit
-    if args.mode == "pr-review":
-        _pr_review_mode(args, findings, entries)
-        if _out_file is not None:
-            _out_file.close()
-        return
-
     if getattr(args, "gen_tests", None):
         written = generate_tftest(findings, entries, Path(args.gen_tests))
         print(f"# gen-tests: wrote {len(written)} file(s) to {args.gen_tests}", file=sys.stderr)
@@ -3256,7 +3842,7 @@ def main():
     suppressed_by_baseline: list[dict] = []
     if getattr(args, "baseline", None):
         retained, suppressed_by_baseline = apply_baseline(
-            findings, Path(args.baseline)
+            findings, Path(args.baseline), _report_target(args),
         )
         if suppressed_by_baseline:
             print(
@@ -3266,6 +3852,16 @@ def main():
                 file=sys.stderr,
             )
         findings = retained
+
+    # PR review mode — post inline comments and exit. After the baseline,
+    # so a baselined finding is neither posted nor gated; it used to run
+    # before the baseline was applied.
+    if args.mode == "pr-review":
+        _pr_review_mode(args, findings, entries)
+        if _out_file is not None:
+            _out_file.close()
+        sys.exit(_gate_exit_code(args, findings, entries, parse_fallback_files,
+                                 unreadable_files, RULE_TIMEOUTS))
 
     # Threat-intel enrichment (R30.2 — KEV + EPSS exploitability ranking).
     # Cross-references each rule's `cwe:` tags with CISA KEV's CWE set
@@ -3309,7 +3905,29 @@ def main():
     # SKILL.md describes the same formula; the constants in detect.py are
     # the single source of truth and the LLM-driven markdown report should
     # cite this same number.
-    summary = _compute_summary(findings, suppressed_findings, suppressed_by_baseline)
+    summary = _compute_summary(
+        findings, suppressed_findings, suppressed_by_baseline,
+        resources_scanned=_scored_resource_count(
+            [b["groups"][0] for t in all_text.values()
+             for b in find_blocks(t, RESOURCE_START)],
+            entries,
+        ),
+    )
+    # Tool diagnostic, not a finding: no score impact. Present only when
+    # non-empty so the summary is unchanged for files that all parse.
+    if parse_fallback_files:
+        summary["parse_fallback_files"] = parse_fallback_files
+    # Likewise only when a rule check ran out of time (`_call_with_budget`).
+    if RULE_TIMEOUTS:
+        summary["rule_timeouts"] = list(RULE_TIMEOUTS)
+    # No Terraform and no plan/state input: the scan checked nothing. With
+    # --fail-on this already exited 2 above; ungated (the GitHub Action
+    # gates in a later step) the flag lets the gate fail instead of
+    # passing a 100 (A) score for an empty or fully-ignored target.
+    if not tf_files and not args.plan_json and not args.state_json:
+        summary["nothing_scanned"] = True
+
+    _gate_findings = findings  # before INFO findings are hidden from output
 
     # INFO-tier findings (e.g. module-reuse suggestions) are advisory and
     # noisy by default. They stay in `summary["counts"]["INFO"]` for
@@ -3355,16 +3973,10 @@ def main():
         _out_file.close()
 
     # Exit code for CI gating
-    if args.fail_on:
-        urgency_rank = {"CRITICAL": 1, "HIGH": 2, "MEDIUM": 3, "LOW": 4, "INFO": 5}
-        threshold = urgency_rank.get(args.fail_on, 3)
-        entry_map = {e["id"]: e for e in entries}
-        for f in findings:
-            entry = entry_map.get(f["id"])
-            if entry:
-                finding_rank = urgency_rank.get(_effective_urgency(f, entry), 3)
-                if finding_rank <= threshold:
-                    sys.exit(1)
+    _rc = _gate_exit_code(args, _gate_findings, entries, parse_fallback_files,
+                          unreadable_files, RULE_TIMEOUTS)
+    if _rc:
+        sys.exit(_rc)
 
 
 # ---- R30.15 topic-module registration -----------------------------------

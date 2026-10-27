@@ -13,8 +13,9 @@ scan flow except scan callables and the catalogue entries:
 
 Both functions use the **callable-injection** pattern from ``_lsp.py``
 (R30.7) so this module doesn't import detect.py — the heavyweight
-helpers (``detect_corpus``, ``detect_in_file``, ``read_normalized``)
-are passed in by the caller. That keeps the seam testable in
+helpers are passed in by the caller: fleet gets a whole per-target scan
+(detect.py's ``_scan_target``, the static pipeline), trend gets
+``detect_in_file``. That keeps the seam testable in
 isolation and prevents the circular-import hazard.
 
 Extracted from ``detect.py`` as the **sixteenth modularisation seam**.
@@ -23,8 +24,11 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import Callable
+
+from _output import _md_code
 
 
 def resolve_fleet_targets(args) -> list[Path]:
@@ -43,13 +47,13 @@ def resolve_fleet_targets(args) -> list[Path]:
 
 def fleet_scan(
     targets: list[Path],
-    entries: list[dict],
-    *,
-    read_normalized: Callable[[Path], str],
-    detect_corpus: Callable[[Path, dict, list], list[dict]],
-    detect_in_file: Callable[[Path, str, list], list[dict]],
+    scan_target: Callable[[Path], dict],
 ) -> dict:
     """Scan multiple repos and cross-correlate findings.
+
+    `scan_target` runs one target through the same pipeline as a static
+    scan (detect.py's `_scan_target`): suppressions, `ignore_rules`,
+    `applies_when` and variable resolution all apply per repo.
 
     Returns::
 
@@ -57,21 +61,21 @@ def fleet_scan(
           "by_target": {str(target): [findings]},
           "fleet_wide": [findings with fleet_count > 1],
           "summary": {str(target): int},
+          "unreadable_files": [str(path)],
+          "parse_fallback_files": [{"file", "reason"}],
+          "suppressed_count": int,
         }
     """
     by_target: dict[str, list[dict]] = {}
+    unreadable_files: list[str] = []
+    parse_fallback_files: list[dict] = []
+    suppressed_count = 0
     for target in targets:
-        tf_files = [p for p in target.rglob("*.tf") if ".terraform" not in p.parts]
-        all_text: dict = {}
-        for fp in tf_files:
-            try:
-                all_text[fp] = read_normalized(fp)
-            except Exception:
-                continue
-        target_findings = detect_corpus(target, all_text, entries)
-        for fp, text in all_text.items():
-            target_findings.extend(detect_in_file(fp, text, entries))
-        by_target[str(target)] = target_findings
+        result = scan_target(target)
+        by_target[str(target)] = result["findings"]
+        unreadable_files.extend(result["unreadable_files"])
+        parse_fallback_files.extend(result["parse_fallback_files"])
+        suppressed_count += len(result["suppressed_findings"])
 
     # Same (rule_id, resource_name, file_base) tuple across >1 target.
     # Use sets so the same finding repeated in one repo only counts
@@ -100,6 +104,9 @@ def fleet_scan(
         "by_target": by_target,
         "fleet_wide": fleet_wide,
         "summary": {t: len(fs) for t, fs in by_target.items()},
+        "unreadable_files": unreadable_files,
+        "parse_fallback_files": parse_fallback_files,
+        "suppressed_count": suppressed_count,
     }
 
 
@@ -113,7 +120,7 @@ def render_fleet_report(fleet_result: dict, fmt: str) -> str:
     lines.append("| Repository | Findings |")
     lines.append("|---|---|")
     for tgt, count in fleet_result["summary"].items():
-        lines.append(f"| `{tgt}` | {count} |")
+        lines.append(f"| {_md_code(tgt)} | {count} |")
 
     fleet_wide = fleet_result.get("fleet_wide", [])
     lines.append(f"\n## Fleet-Wide Findings ({len(fleet_wide)} across multiple repos)\n")
@@ -123,7 +130,7 @@ def render_fleet_report(fleet_result: dict, fmt: str) -> str:
         for f in fleet_wide:
             repos_short = ", ".join(r.rsplit("/", 1)[-1] for r in f.get("fleet_repos", []))
             lines.append(
-                f"| {f['id']} | `{f.get('resource','')}` | "
+                f"| {f['id']} | {_md_code(f.get('resource',''))} | "
                 f"{f.get('fleet_count',0)} | {repos_short} |"
             )
     else:
@@ -131,12 +138,12 @@ def render_fleet_report(fleet_result: dict, fmt: str) -> str:
 
     lines.append("\n## Per-Repo Findings\n")
     for tgt, fs in fleet_result["by_target"].items():
-        lines.append(f"### `{tgt}` ({len(fs)} finding{'s' if len(fs) != 1 else ''})\n")
+        lines.append(f"### {_md_code(tgt)} ({len(fs)} finding{'s' if len(fs) != 1 else ''})\n")
         for f in fs[:50]:  # cap per-repo lines to keep the report skim-able
             lines.append(
                 f"- `{f['id']}` "
                 f"{f.get('file','').rsplit('/',2)[-1]}:{f.get('line','')} "
-                f"`{f.get('resource','')}`"
+                f"{_md_code(f.get('resource',''))}"
             )
         if len(fs) > 50:
             lines.append(f"- _...and {len(fs)-50} more_")
@@ -245,7 +252,7 @@ def render_trend_table(rows: list[dict], fmt: str) -> str:
     for r in rows:
         net_str = f"+{r['net']}" if r["net"] > 0 else str(r["net"])
         lines.append(
-            f"| {r['date']} | `{r['sha']}` | +{r['new']} | -{r['resolved']} | "
+            f"| {r['date']} | {_md_code(r['sha'])} | +{r['new']} | -{r['resolved']} | "
             f"{net_str} | {r['total']} |"
         )
     total_new = sum(r["new"] for r in rows)
